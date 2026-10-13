@@ -1,5 +1,17 @@
-"""Explicit opt-in ROS2 topic backend; importing it does not initialize ROS."""
+"""Explicit opt-in ROS2 backend; importing it does not initialize ROS."""
 
-from .backend import RosCommand, Ros2Backend, RosObservation
+from .backend import (
+    RosCommand,
+    Ros2Backend,
+    RosObservation,
+    resolve_qos,
+    image_backends,
+)
 
-__all__ = ["Ros2Backend", "RosCommand", "RosObservation"]
+__all__ = [
+    "Ros2Backend",
+    "RosCommand",
+    "RosObservation",
+    "image_backends",
+    "resolve_qos",
+]

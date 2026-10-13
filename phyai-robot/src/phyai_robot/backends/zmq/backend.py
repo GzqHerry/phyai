@@ -39,8 +39,15 @@ class ZmqBackend(_ThreadedBackend):
         check_reply: Callable[[Sequence[bytes]], None],  # Raise on rejection/bad reply.
         io_timeout_s: float = 0.1,  # End-to-end command acceptance budget.
         connect_timeout_s: float = 5.0,  # Local socket/worker setup budget.
+        stop_timeout_s: float | None = None,  # Stop acceptance budget; None = io.
     ) -> None:
-        super().__init__(observation_keys, action_keys, io_timeout_s, connect_timeout_s)
+        super().__init__(
+            observation_keys,
+            action_keys,
+            io_timeout_s,
+            connect_timeout_s,
+            stop_timeout_s,
+        )
         self._observation_endpoint: str = observation_endpoint
         self._command_endpoint: str = command_endpoint
         self._decode: Callable[[Sequence[bytes]], Mapping[str, NDArray[Any]]] = (
@@ -135,7 +142,7 @@ class ZmqBackend(_ThreadedBackend):
             return
         if self._requester is None:
             self._new_requester()
-        self._exchange(self._encode_stop(), time.monotonic() + self._io_timeout_s)
+        self._exchange(self._encode_stop(), time.monotonic() + self._stop_timeout_s)
 
     def _close_device(self) -> None:
         for socket in (self._subscriber, self._requester):

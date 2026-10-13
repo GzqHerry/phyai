@@ -6,8 +6,20 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from phyai_robot.backends.ros2 import Ros2Backend, RosCommand, RosObservation
-from phyai_robot.backends.ros2.codecs import decode_rgb_image, decode_joint_positions
+from phyai_robot.backends.ros2 import (
+    RosCommand,
+    Ros2Backend,
+    RosObservation,
+    resolve_qos,
+    image_backends,
+)
+from phyai_robot.backends.ros2.codecs import (
+    decode_pose,
+    decode_wrench,
+    decode_rgb_image,
+    decode_nv12_image,
+    decode_joint_positions,
+)
 
 
 def test_grouped_topics_preserve_fields_stamp_order_and_ownership(fake_ros):
@@ -239,3 +251,151 @@ def test_default_decode_error_remains_fatal(fake_ros):
     with pytest.raises(RuntimeError, match="transport worker failed"):
         backend.close()
     assert not fake_ros.publications
+
+
+def _request(data=None):
+    return SimpleNamespace(data=data)
+
+
+def test_service_calls_run_on_the_worker_and_check_success(fake_ros):
+    fake_ros.services["/svc/ok"] = lambda request: SimpleNamespace(success=True)
+    fake_ros.services["/svc/no"] = lambda request: SimpleNamespace(
+        success=False, message="busy"
+    )
+    backend = Ros2Backend(observations={}, actions={})
+    try:
+        backend.connect()
+        backend.call_service(object, "/svc/ok", _request(3), timeout_s=1)
+        assert fake_ros.calls[0][:2] == ("/svc/ok", 3)
+        assert fake_ros.calls[0][2] != threading.get_ident()
+        with pytest.raises(RuntimeError, match="rejected the request: busy"):
+            backend.call_service(object, "/svc/no", _request(), timeout_s=1)
+        with pytest.raises(TimeoutError, match="not available"):
+            backend.call_service(object, "/svc/missing", _request(), timeout_s=0.05)
+        # A rejected or unavailable service does not fault the session.
+        backend.call_service(object, "/svc/ok", _request(4), timeout_s=1)
+    finally:
+        backend.close()
+
+
+def test_stop_hook_has_its_own_timeout_longer_than_io(fake_ros):
+    """A controller service slower than io_timeout_s still completes on stop."""
+    import time
+
+    def slow_idle(request):
+        time.sleep(0.3)
+        return SimpleNamespace(success=True)
+
+    fake_ros.services["/tj/control/set_input"] = slow_idle
+
+    def on_stop(backend):
+        backend.call_service(object, "/tj/control/set_input", _request(0), timeout_s=1)
+
+    backend = Ros2Backend(
+        observations={},
+        actions={
+            "a": RosCommand("/a", fake_ros.JointState, lambda v: fake_ros.JointState())
+        },
+        on_stop=on_stop,
+        io_timeout_s=0.05,
+        stop_timeout_s=1.5,
+    )
+    backend.connect()
+    backend.stop()
+    backend.close()
+    assert [name for name, *_ in fake_ros.calls] == ["/tj/control/set_input"]
+
+
+def test_stop_reports_timeout_when_stop_hook_exceeds_stop_timeout(fake_ros):
+    import time
+
+    def slow_idle(request):
+        time.sleep(0.4)
+        return SimpleNamespace(success=True)
+
+    fake_ros.services["/idle"] = slow_idle
+    backend = Ros2Backend(
+        observations={},
+        actions={
+            "a": RosCommand("/a", fake_ros.JointState, lambda v: fake_ros.JointState())
+        },
+        on_stop=lambda b: b.call_service(object, "/idle", _request(), timeout_s=1),
+        io_timeout_s=0.05,
+        stop_timeout_s=0.1,
+    )
+    backend.connect()
+    with pytest.raises(TimeoutError, match="stop timed out"):
+        backend.stop()
+    # The worker still finishes the in-flight request and is not asked twice.
+    with pytest.raises(RuntimeError, match="transport worker failed"):
+        backend.close()
+    assert len(fake_ros.calls) == 1
+
+
+def test_named_qos_profiles_are_resolved_on_the_worker(fake_ros):
+    backend = Ros2Backend(
+        observations={
+            "a": RosObservation("/a", object, lambda m: m, "sensor_data"),
+            "b": RosObservation("/b", object, lambda m: m, "reliable"),
+        },
+        actions={
+            "c": RosCommand("/c", fake_ros.JointState, lambda v: v, "best_effort")
+        },
+        on_stop=lambda backend: None,
+    )
+    try:
+        backend.connect()
+        node = fake_ros.nodes[0]
+        assert node.subscriptions["/a"][0][2] is fake_ros.sensor_qos
+        assert node.subscriptions["/b"][0][2].reliability == "reliable"
+        assert node.publishers["/c"].qos.reliability == "best_effort"
+    finally:
+        backend.close()
+    with pytest.raises(ValueError, match="unknown QoS"):
+        resolve_qos("fast")
+
+
+def test_image_backends_decode_each_camera_on_its_own_worker(fake_ros):
+    backends = image_backends(
+        {"front": "/front", "side": "/side"},
+        message_type=object,
+        decode=lambda message: np.full((2, 2, 3), message, dtype=np.uint8),
+        node_name="cams",
+    )
+    try:
+        for backend in backends:
+            backend.connect()
+        fake_ros.feed("/front", 1)
+        fake_ros.feed("/side", 2)
+        assert [backend.observation_keys for backend in backends] == [
+            {"front"},
+            {"side"},
+        ]
+        assert [node.name for node in fake_ros.nodes] == ["cams_front", "cams_side"]
+        assert backends[1].read()["side"].value[0, 0, 0] == 2
+    finally:
+        for backend in backends:
+            backend.close()
+
+
+def test_nv12_decoder_uses_opencv_and_checks_size():
+    cv2 = pytest.importorskip("cv2")
+    frame = np.random.default_rng(0).integers(0, 256, (6, 4), dtype=np.uint8)
+    message = SimpleNamespace(height=4, width=4, data=frame.tobytes())
+    np.testing.assert_array_equal(
+        decode_nv12_image(message), cv2.cvtColor(frame, cv2.COLOR_YUV2RGB_NV12)
+    )
+    with pytest.raises(ValueError, match="NV12 data"):
+        decode_nv12_image(SimpleNamespace(height=4, width=4, data=b"\0" * 10))
+
+
+def test_pose_and_wrench_decoders_flatten_in_documented_order():
+    vector = SimpleNamespace(x=1.0, y=2.0, z=3.0)
+    pose = SimpleNamespace(
+        pose=SimpleNamespace(
+            position=vector, orientation=SimpleNamespace(x=4.0, y=5.0, z=6.0, w=7.0)
+        )
+    )
+    wrench = SimpleNamespace(wrench=SimpleNamespace(force=vector, torque=vector))
+    np.testing.assert_array_equal(decode_pose(pose), [1, 2, 3, 4, 5, 6, 7])
+    np.testing.assert_array_equal(decode_wrench(wrench), [1, 2, 3, 1, 2, 3])

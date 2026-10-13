@@ -47,6 +47,9 @@ class FakeRos:
         self.publications = []
         self.stamps = 0
         self.sensor_qos = object()
+        # Service name -> handler(request) -> response; calls record (name, data, thread).
+        self.services = {}
+        self.calls = []
         owner = self
 
         def record(kind, obj):
@@ -88,6 +91,7 @@ class FakeRos:
                 self.subscriptions = {}
                 self.publishers = {}
                 self.pending = queue.Queue()
+                self.pending_calls = []
                 self.closed = False
                 self.owner = threading.get_ident()
                 owner.nodes.append(self)
@@ -105,6 +109,10 @@ class FakeRos:
                 record("publisher.open", self)
                 return publisher
 
+            def create_client(self, service_type, name):
+                record("client.open", self)
+                return Client(self, name)
+
             def get_clock(self):
                 def stamp():
                     record("stamp", self)
@@ -116,6 +124,32 @@ class FakeRos:
             def destroy_node(self):
                 self.closed = True
                 record("node.close", self)
+
+        class Future:
+            def __init__(self):
+                self.value, self.finished = None, False
+
+            def done(self):
+                return self.finished
+
+            def result(self):
+                return self.value
+
+        class Client:
+            def __init__(self, node, name):
+                self.node, self.name = node, name
+                self.removed = []
+
+            def wait_for_service(self, timeout_sec=None):
+                return self.name in owner.services
+
+            def call_async(self, request):
+                future = Future()
+                self.node.pending_calls.append((self.name, request, future))
+                return future
+
+            def remove_pending_request(self, future):
+                self.removed.append(future)
 
         class Executor:
             def __init__(self, *, context):
@@ -141,6 +175,25 @@ class FakeRos:
                 while not self.stopped:
                     self.spin_once()
 
+            def spin_until_future_complete(self, future, timeout_sec=None):
+                import time
+
+                deadline = time.monotonic() + (timeout_sec or 0)
+                for node in self.nodes:
+                    while node.pending_calls and time.monotonic() < deadline:
+                        name, request, pending = node.pending_calls.pop(0)
+                        record("service." + name, node)
+                        owner.calls.append(
+                            (
+                                name,
+                                getattr(request, "data", None),
+                                threading.get_ident(),
+                            )
+                        )
+                        response = owner.services[name](request)
+                        if response is not None and time.monotonic() < deadline:
+                            pending.value, pending.finished = response, True
+
             def shutdown(self, timeout_sec=None):
                 self.stopped = True
 
@@ -164,7 +217,24 @@ class FakeRos:
         rclpy.context = module("rclpy.context", Context=Context)
         rclpy.node = module("rclpy.node", Node=Node)
         rclpy.executors = module("rclpy.executors", SingleThreadedExecutor=Executor)
-        rclpy.qos = module("rclpy.qos", qos_profile_sensor_data=self.sensor_qos)
+
+        class QoSProfile(SimpleNamespace):
+            pass
+
+        policy = SimpleNamespace(
+            KEEP_LAST="keep_last",
+            VOLATILE="volatile",
+            RELIABLE="reliable",
+            BEST_EFFORT="best_effort",
+        )
+        rclpy.qos = module(
+            "rclpy.qos",
+            qos_profile_sensor_data=self.sensor_qos,
+            QoSProfile=QoSProfile,
+            HistoryPolicy=policy,
+            DurabilityPolicy=policy,
+            ReliabilityPolicy=policy,
+        )
         sensor_msgs = module("sensor_msgs")
         sensor_msgs.msg = module("sensor_msgs.msg", Image=Image, JointState=JointState)
         self.JointState, self.Image = JointState, Image

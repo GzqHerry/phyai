@@ -207,9 +207,14 @@ class PI05Processor(BaseModelProcessor):
         )
 
     def build_postprocessor(self) -> ProcessorPipeline:
+        # Only actions are unnormalized. A caller-supplied raw state, used as a
+        # delta anchor, must reach later steps unchanged.
+        action_stats = {
+            k: v for k, v in (self.dataset_stats or {}).items() if k == ACTION_FEATURE
+        }
         steps = [
             UnnormalizerStep(
-                features=_features_for_stats(self.dataset_stats),
+                features=_features_for_stats(action_stats),
                 norm_map=PI05_NORM_MAP,
                 stats=self.dataset_stats,
                 device=self.device,

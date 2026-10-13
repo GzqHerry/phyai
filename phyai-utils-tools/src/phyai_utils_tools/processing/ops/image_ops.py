@@ -53,6 +53,8 @@ def resize_with_pad(
         raise ValueError("Image dimensions must be positive")
     if backend == "pil" and (images.dtype != torch.uint8 or images.shape[1] != 3):
         raise ValueError("PIL resize requires RGB uint8 images")
+    if backend == "pil" and (pad_value != int(pad_value) or not 0 <= pad_value <= 255):
+        raise ValueError("PIL resize needs an integer pad_value in [0, 255]")
     if cur_h == target_h and cur_w == target_w:
         return images
 

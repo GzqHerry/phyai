@@ -1,9 +1,10 @@
 """Optional robot support; importing this package loads no GPU or transport SDK."""
 
-from .robot import Robot, CompositeRobot
+from .robot import Robot, CompositeRobot, take_snapshot, wait_for_observation
 from .types import (
     Action,
     Sample,
+    Schema,
     ActionChunk,
     FeatureSpec,
     Observation,
@@ -11,7 +12,8 @@ from .types import (
     ObservationSchema,
     ObservationNotReady,
 )
-from .policy import Policy, EnginePolicy, PolicyAdapter, ObservationAdapter
+from .policy import Policy, EnginePolicy, PolicyAdapter
+from .scheduling import Scheduler, StopAndRefill, InferenceContext
 from .deployment import RobotDeployment, DeploymentOptions
 
 __all__ = [
@@ -22,8 +24,8 @@ __all__ = [
     "DeploymentOptions",
     "EnginePolicy",
     "FeatureSpec",
+    "InferenceContext",
     "Observation",
-    "ObservationAdapter",
     "ObservationNotReady",
     "ObservationSchema",
     "Policy",
@@ -31,4 +33,9 @@ __all__ = [
     "Robot",
     "RobotDeployment",
     "Sample",
+    "Scheduler",
+    "Schema",
+    "StopAndRefill",
+    "take_snapshot",
+    "wait_for_observation",
 ]

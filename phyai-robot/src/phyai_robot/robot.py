@@ -1,9 +1,12 @@
-"""Whole-robot interface and a small implementation assembled from sessions."""
+"""Whole-robot interface, a robot assembled from sessions, and snapshot helpers."""
 
 from __future__ import annotations
 
+import time
+import threading
 from types import MappingProxyType
 from typing import Protocol
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Mapping, Callable, Sequence
 
 from .types import (
@@ -18,6 +21,7 @@ from ._compat import BaseExceptionGroup
 from .validation import (
     freeze_values,
     freeze_samples,
+    check_freshness,
     validate_schema,
     validate_values,
     validate_observation,
@@ -88,7 +92,7 @@ class CompositeRobot:
         )
         self._action_schema: ActionSchema = MappingProxyType(dict(action_schema))
         self._backends: tuple[Backend, ...] = tuple(backends)
-        self._action_guard: Callable[[Action], None] | None = action_guard
+        self._action_guard = action_guard
         if len({id(backend) for backend in self._backends}) != len(self._backends):
             raise ValueError("a backend instance must not be supplied twice")
         for attr, schema in (
@@ -104,13 +108,9 @@ class CompositeRobot:
             if seen != set(schema):
                 raise ValueError(f"backend {attr} do not exactly cover the schema")
         self._opened: list[Backend] = []  # Includes the session currently connecting.
-        self._connected: bool = (
-            False  # True only after all sessions opened successfully.
-        )
-        self._stopped: bool = (
-            False  # A stopped robot cannot implicitly resume on write.
-        )
-        self._closed: bool = False  # Instances are single-use after close or failure.
+        self._connected = False  # True only after all sessions opened successfully.
+        self._stopped = False  # A stopped robot cannot implicitly resume on write.
+        self._closed = False  # Instances are single-use after close or failure.
 
     @property
     def observation_schema(self) -> ObservationSchema:
@@ -119,6 +119,11 @@ class CompositeRobot:
     @property
     def action_schema(self) -> ActionSchema:
         return self._action_schema
+
+    @property
+    def backends(self) -> tuple[Backend, ...]:
+        """Sessions in write order, for device services outside the Robot API."""
+        return self._backends
 
     def connect(self) -> None:
         if self._closed or self._stopped:
@@ -208,3 +213,51 @@ class CompositeRobot:
         self._connected = False
         if errors:
             raise BaseExceptionGroup("robot cleanup failed", errors)
+
+
+def take_snapshot(robot: Robot, *, max_age_s: float) -> Observation:
+    """Read one detached, validated observation whose fields are all fresh.
+
+    Custom robots receive the same detachment and validation as CompositeRobot.
+    Missing and stale fields both raise ObservationNotReady; malformed values
+    and transport failures propagate unchanged.
+    """
+    raw = robot.get_observation()
+    observation = Observation(freeze_samples(raw.samples))
+    validate_observation(observation, robot.observation_schema)
+    check_freshness(observation, max_age_s)
+    return observation
+
+
+def wait_for_observation(
+    robot: Robot,
+    *,
+    timeout_s: float,
+    max_age_s: float,
+    lock: AbstractContextManager[object] | None = None,
+    stop_event: threading.Event | None = None,
+) -> Observation | None:
+    """Poll take_snapshot until it succeeds; return None if stop_event is set.
+
+    Only missing or stale samples are retried. Each attempt holds lock, if any,
+    so a deployment can serialize reads with its control writes. Raises
+    TimeoutError after timeout_s without a complete, fresh observation.
+    """
+    deadline = time.monotonic() + timeout_s
+    lock = nullcontext() if lock is None else lock
+    while True:
+        with lock:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            try:
+                return take_snapshot(robot, max_age_s=max_age_s)
+            except ObservationNotReady as error:
+                reason = error
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"timed out waiting for a complete, fresh observation: {reason}"
+            ) from reason
+        if stop_event is None:
+            time.sleep(0.01)
+        elif stop_event.wait(0.01):
+            return None

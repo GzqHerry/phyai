@@ -1,10 +1,11 @@
-"""Prediction and robot/checkpoint conversion, without importing a model stack."""
+"""Prediction and robot/model conversion, without importing a model stack."""
 
 from __future__ import annotations
 
 from typing import Any, Generic, TypeVar, Protocol
 
 from .types import ActionChunk, Observation
+from .scheduling import InferenceContext
 
 RequestT = TypeVar("RequestT")
 ResultT = TypeVar("ResultT")
@@ -25,8 +26,14 @@ class Policy(Protocol[RequestT, ResultT]):
 class PolicyAdapter(Protocol[RequestT, ResultT]):
     """Connect robot snapshots to one policy's concrete input/output types."""
 
-    def to_request(self, observation: Observation) -> RequestT:
-        """Select fields and apply checkpoint-specific preprocessing."""
+    def to_request(
+        self, observation: Observation, context: InferenceContext
+    ) -> RequestT:
+        """Select fields and convert them to the model's input convention.
+
+        context describes what the scheduler will still execute while this
+        prediction runs. Stop-and-refill always passes an empty context.
+        """
         ...
 
     def to_actions(self, result: ResultT, observation: Observation) -> ActionChunk:
@@ -49,19 +56,7 @@ class EnginePolicy(Generic[RequestT, ResultT]):
     def __init__(self, engine: Any) -> None:
         if not callable(getattr(engine, "step", None)):
             raise TypeError("engine must provide step(request)")
-        self._engine: Any = (
-            engine  # Shared or private Engine; never closed by this wrapper.
-        )
+        self._engine: Any = engine  # Shared or private; never closed by this wrapper.
 
     def predict(self, request: RequestT) -> ResultT:
         return self._engine.step(request)
-
-
-class ObservationAdapter:
-    """Pair an Observation -> ActionChunk policy with the existing control loop."""
-
-    def to_request(self, observation: Observation) -> Observation:
-        return observation
-
-    def to_actions(self, result: ActionChunk, observation: Observation) -> ActionChunk:
-        return result

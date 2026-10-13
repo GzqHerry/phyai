@@ -56,11 +56,14 @@ class Observation:
 
 @dataclass(frozen=True)
 class ActionChunk:
-    """Predicted targets; Deployment resamples them into individual commands."""
+    """Ordered single-step targets predicted from one observation.
+
+    The rate at which targets are consumed belongs to the deployment's scheduler,
+    not to the chunk, so one prediction can be replayed at a configured speed.
+    """
 
     actions: tuple[Action, ...]  # Nonempty, ordered, complete single-step targets.
-    step_period_s: float  # Time between source targets, in seconds.
 
 
 class ObservationNotReady(RuntimeError):
-    """At least one required sensor has not produced its first sample yet."""
+    """A required sensor has no sample yet, or its latest sample is too old."""

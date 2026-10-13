@@ -9,8 +9,7 @@ import numpy as np
 from phyai_robot import ActionChunk
 
 from ..policies import Pi05PolicyRequest
-from ..robots.agilex import action_from_target, state_from_observation
-from ..robots.agilex_protocol import VIEWS
+from ..layouts.agilex import VIEWS, action_from_target, state_from_observation
 
 
 class AgilexPi05Adapter:

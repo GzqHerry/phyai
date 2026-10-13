@@ -1,5 +1,7 @@
 """Exercise composite ownership, mixed sessions, and partial-failure cleanup."""
 
+from phyai_robot._compat import ExceptionGroup
+
 import numpy as np
 import pytest
 from phyai_robot import (

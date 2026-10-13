@@ -11,7 +11,7 @@ from .types import (
     ObservationSchema,
     ObservationNotReady,
 )
-from .policy import Policy, EnginePolicy, PolicyAdapter
+from .policy import Policy, EnginePolicy, PolicyAdapter, ObservationAdapter
 from .deployment import RobotDeployment, DeploymentOptions
 
 __all__ = [
@@ -23,6 +23,7 @@ __all__ = [
     "EnginePolicy",
     "FeatureSpec",
     "Observation",
+    "ObservationAdapter",
     "ObservationNotReady",
     "ObservationSchema",
     "Policy",

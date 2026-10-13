@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Generic, TypeVar, Protocol
 
 from .types import ActionChunk, Observation
 
+RequestT = TypeVar("RequestT")
+ResultT = TypeVar("ResultT")
 
-class Policy[RequestT, ResultT](Protocol):
+
+class Policy(Protocol[RequestT, ResultT]):
     """Bind model input/output types without prescribing their data layout.
 
     RequestT is the object produced by the paired adapter. ResultT is the
@@ -19,7 +22,7 @@ class Policy[RequestT, ResultT](Protocol):
         ...
 
 
-class PolicyAdapter[RequestT, ResultT](Protocol):
+class PolicyAdapter(Protocol[RequestT, ResultT]):
     """Connect robot snapshots to one policy's concrete input/output types."""
 
     def to_request(self, observation: Observation) -> RequestT:
@@ -35,7 +38,7 @@ class PolicyAdapter[RequestT, ResultT](Protocol):
         ...
 
 
-class EnginePolicy[RequestT, ResultT]:
+class EnginePolicy(Generic[RequestT, ResultT]):
     """Wrap Engine.step; the application supplies its request and result types.
 
     The engine itself stays dynamic so this standalone package does not need
@@ -52,3 +55,13 @@ class EnginePolicy[RequestT, ResultT]:
 
     def predict(self, request: RequestT) -> ResultT:
         return self._engine.step(request)
+
+
+class ObservationAdapter:
+    """Pair an Observation -> ActionChunk policy with the existing control loop."""
+
+    def to_request(self, observation: Observation) -> Observation:
+        return observation
+
+    def to_actions(self, result: ActionChunk, observation: Observation) -> ActionChunk:
+        return result

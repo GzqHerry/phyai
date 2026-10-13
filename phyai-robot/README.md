@@ -7,7 +7,7 @@ deployment loop across robots, and replace the policy without rewriting device
 communication.
 
 The package runs independently of the PhyAI inference engine. Its core depends
-only on NumPy and includes a Mock backend for development without hardware.
+on NumPy (plus an exception-group backport on Python 3.10) and includes a Mock backend for development without hardware.
 ROS2 and ZMQ backends handle device communication; the application supplies the
 message conversions and controller-specific stop behavior.
 
@@ -16,6 +16,7 @@ message conversions and controller-specific stop behavior.
 - [Understand the dual-arm example](#understand-the-dual-arm-example)
 - [Control timing](#control-timing)
 - [Connect your robot](#connect-your-robot)
+- [Separate robot and inference environments](#separate-robot-and-inference-environments)
 
 ## Design and interfaces
 
@@ -107,8 +108,10 @@ also detach its returned observations from mutable receive buffers.
 
 ## Install and run
 
-Use Python 3.12+ and [uv](https://docs.astral.sh/uv/). Run repository commands
-from the **PhyAI repository root**, one directory above this README.
+The standalone package supports Python 3.10+. PhyAI and root-workspace commands
+require Python 3.12+. Run the examples below from the **PhyAI repository root**,
+one directory above this README; keep a robot's interpreter compatible with its
+native ROS/SDK installation.
 
 ### Try the Mock example without a GPU
 
@@ -165,31 +168,30 @@ against the environment you have already prepared. See uv's
 
 ### Install Robot without the engine
 
-Use a separate environment when developing device communication independently
-of an existing PhyAI environment:
+Create an independent environment with the native interpreter and install the
+local package through `uv pip`. This bypasses the root workspace's Python 3.12
+constraint and does not install the inference engine:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-robot \
-  uv sync --package phyai-robot --no-default-groups
-
-UV_PROJECT_ENVIRONMENT=.venv-robot \
-  uv run --no-sync python examples/deployment/mock_loop.py --steps 30
+/usr/bin/python3 -m venv --without-pip --system-site-packages .venv-robot
+uv pip install --python .venv-robot/bin/python './phyai-robot[zmq]'
+.venv-robot/bin/python examples/deployment/mock_loop.py --steps 30
 ```
 
-Add `--extra zmq` to the sync command for ZMQ. `--no-default-groups` omits default
-development tool groups. Package selection limits what is installed, but uv still
-resolves the workspace together. The isolated command above bypasses workspace
-resolution if you only need to try Robot.
+The `zmq` extra supports both inference RPC and the robot I/O ZMQ backend. Omit
+it when only the core/Mock/ROS backend is needed. `--system-site-packages` lets a
+native robot environment see distribution-provided packages; source the relevant
+ROS and message overlays in its shell. New packages are installed into the venv.
 
-In an application outside this repository, declare the local package as an
-editable dependency instead:
+For the supported AgileX and Tianji deployments, use the matching dependency
+lock, wheel and installer in the [environment guide](../examples/deployment/ROBOT_ENVIRONMENTS.md).
+That guide also covers installing the same lightweight wheel in the model
+process. Deployment examples/configs are distributed alongside the wheel; the
+wheel alone does not contain their entry points.
 
-```bash
-uv add --editable /path/to/phyai/phyai-robot --extra zmq
-```
-
-Replace the path with your checkout and omit `--extra zmq` for the core alone.
-This records the dependency and source in your application's `pyproject.toml`.
+Do not use root `uv sync --package phyai-robot` to install a Python 3.10 robot:
+package selection does not remove the workspace's Python version constraint.
+Always launch `.venv-robot/bin/python` explicitly after installation.
 
 ### Backend dependencies
 
@@ -396,16 +398,35 @@ Start from the Mock example and replace one boundary at a time:
 | Backend | Configure | Behavior |
 | --- | --- | --- |
 | [`MockBackend`](src/phyai_robot/backends/mock/backend.py) | `initial_values`, `action_to_observation` | Copies commands into mapped feedback; useful for testing schemas, adapters, and control logic. |
-| [`Ros2Backend`](src/phyai_robot/backends/ros2/backend.py) | Per-field `RosObservation(topic, message_type, decode, qos)` and `RosCommand(topic, message_type, encode, qos)`; `on_stop(node)` for command backends | Subscribes to observations and publishes commands using an owned node, context, and executor on one worker thread. |
+| [`Ros2Backend`](src/phyai_robot/backends/ros2/backend.py) | Field/group `RosObservation(topic, message_type, decode, qos)` and `RosCommand(topic, message_type, encode, qos)`; `on_stop(node)` for command backends | Subscribes to observations and publishes commands using an owned node, context, and executor on one worker thread. |
 | [`ZmqBackend`](src/phyai_robot/backends/zmq/backend.py) | PUB/REP peer endpoints, owned keys, `decode_observation`, `encode_action`, `encode_stop`, and `check_reply` | Receives observations through SUB and submits commands through REQ/REP. Application codecs define the multipart byte format and validate acceptance replies. |
 
-A ROS decoder must produce a NumPy array in the field's declared units, joint
-order, and dtype. Its encoder performs the reverse conversion for the controller.
+A string binding key maps one NumPy array to one ROS message. A tuple key maps
+several named fields to one message: its decoder returns a dictionary with
+exactly those keys, and its encoder receives that dictionary. Fields from one
+received message share a timestamp and enter the cache together. Grouped
+commands publish in binding declaration order; existing single-field bindings
+retain the supplied action order. Every encoder completes before any message
+is published. Publishing multiple topics is not atomic.
+
+Set `RosCommand(stamp=True)` to fill `header.stamp` from the backend's ROS clock
+immediately before publication. `domain_id=None` uses the native ROS environment;
+an explicit domain applies to that backend's context. A decoder failure normally
+ends the worker. `RosObservation(recover_on_next_message=True)` instead makes
+`read()` report the failure until the next valid message on that binding, without
+changing other bindings' error state.
+
+Decoders preserve the schema's units, joint order and dtype. The pure
+`backends.ros2.codecs.decode_rgb_image` helper handles 8-bit RGB/BGR/RGBA/BGRA/mono
+images with row padding. `decode_joint_positions` returns JointState positions
+in a requested name order. Neither helper imports ROS. Keep robot-specific
+joint/gripper layouts in the deployment bindings.
 The `on_stop` callback runs on the backend's worker and must finish within the
 I/O budget without waiting for callbacks on that same worker. This backend covers
 topics; controllers requiring specialized ROS actions or services can implement
-`Backend` directly. ROS2 integration tests are currently
-[TODO](tests/backends/test_ros2.py).
+`Backend` directly. [Offline ROS backend tests](tests/backends/test_ros2.py)
+exercise the public contract with in-memory contexts and topics; real middleware
+and QoS interoperability still require hardware integration testing.
 
 For ZMQ, define an explicit stop message and check the reply from your device.
 The backend does not choose a serialization format or automatically replay failed
@@ -452,10 +473,11 @@ and the [source directory](src/phyai_robot) for the typed interfaces and impleme
 ## Tianji pi0.5 deployment
 
 The live entry point is [`examples/deployment/tianji.py`](../examples/deployment/tianji.py).
-Its opening docstring describes environment setup, controller modes, every YAML
-setting, bounded trials, and continuous deployment. The example keeps embodiment
+See the [environment guide](../examples/deployment/ROBOT_ENVIRONMENTS.md) for
+installation and separate model/client startup. The example keeps embodiment
 construction in `robots/tianji.py`, model I/O in `adapters/tianji_pi05.py`, and
-editable defaults in `configs/tianji.yaml`. OmegaConf merges typed YAML with
+robot defaults in `configs/tianji.yaml`. Model defaults live separately in
+`configs/pi05_tianji.yaml` and are loaded by `serve_pi05.py`. OmegaConf merges typed YAML with
 dotted command-line overrides; `--print-config` inspects settings without
 connecting to ROS or allocating a model. The loader has no robot/model-specific
 fields: Tianji connection settings live with its factory, pi0.5 mapping settings
@@ -463,3 +485,25 @@ live with its adapter, and the entry point composes their schemas. Running
 without `--print-config` enables control and executes model actions. Check
 controller ownership and physical gripper calibration before launching; these
 are operator responsibilities, not automatically discovered service state.
+
+## Separate robot and inference environments
+
+The standalone package supports Python >=3.10; the PhyAI workspace still requires
+Python >=3.12. A robot can run native ROS/SDK Python while the model runs in a
+separate environment. `phyai_robot.remote.RemotePolicy` sends an `Observation`
+and receives an `ActionChunk`. `PolicyServer` wraps the original policy and
+adapter; `ObservationAdapter` connects this remote policy to the unchanged
+`RobotDeployment`. Install the `zmq` extra for RPC. Neither base imports nor
+remote imports require Torch, PhyAI, ROS, or an active ZMQ context.
+
+For both AgileX and Tianji, `make_*_robot` assembles `CompositeRobot` from two
+`Ros2Backend` instances: one for camera decoding, one for non-image feedback and
+commands. `_ThreadedBackend` supplies their worker lifecycle; it is also used by
+`ZmqBackend`. Robot examples configure messages and fields without implementing
+another transport. The inference RPC classes have separate socket ownership and
+do not inherit that robot-I/O worker.
+
+See [deployment environments](../examples/deployment/ROBOT_ENVIRONMENTS.md) for
+the two tested host profiles, independent wheel installation, both startup
+commands, protocol ownership and lifecycle. Use the same source-identified wheel
+on both ends, not separate robot-specific framework branches.

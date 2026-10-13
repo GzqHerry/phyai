@@ -8,6 +8,7 @@ Schema field types are checked by OmegaConf before the caller's validator runs.
 from __future__ import annotations
 
 import argparse
+from typing import TypeVar
 from pathlib import Path
 from collections.abc import Callable, Sequence
 
@@ -32,7 +33,10 @@ def repository_path(value: str) -> Path:
     return (REPOSITORY_ROOT / Path(value).expanduser()).resolve()
 
 
-def parse_config[ConfigT](
+ConfigT = TypeVar("ConfigT")
+
+
+def parse_config(
     schema: type[ConfigT],
     *,
     default_config: Path,

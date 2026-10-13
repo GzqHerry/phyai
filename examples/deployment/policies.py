@@ -1,8 +1,8 @@
 """PhyAI pi0.5 policy execution, independent of a particular robot.
 
 The adapter supplies preprocessed tensors; the policy owns the engine and a
-seeded CPU noise stream. Keeping engine setup here leaves deployment entry
-points responsible only for composing a robot, an adapter, and a control loop.
+seeded CPU noise stream. The model-server entry point composes this policy with
+an adapter; the robot-client entry point composes backends and a control loop.
 """
 
 from __future__ import annotations
@@ -87,7 +87,7 @@ class Pi05PolicyRequest:
 class Pi05Policy:
     """Own a BF16 PhyAI engine and a reproducible stream of diffusion noise.
 
-    The deployment worker calls predict synchronously. This class does not read
+    PolicyServer calls predict synchronously. This class does not read
     sensors, maintain an action queue, interpolate commands, or publish to ROS.
     A lock serializes access to the engine, its graph buffers, and the generator.
     close may run on the shutdown thread while predict is still active; an event
@@ -139,6 +139,7 @@ class Pi05Policy:
         self._max_action_dim = int(config.max_action_dim)
         # CPU noise avoids coupling this stream to the engine's CUDA RNG state.
         # Reproducibility is per call sequence, including the discarded warmup.
+        self._seed = seed
         self._generator = torch.Generator().manual_seed(seed)
         # Pass the resolved model config through the plugin's existing API so
         # the override reaches setup/capture rather than being overwritten by a
@@ -178,7 +179,8 @@ class Pi05Policy:
         The returned tensor is detached float32 on CPU. It still includes the
         model's padded action coordinates; the adapter slices, unnormalizes, and
         interprets them using the observation paired with this request.
-        Engine errors propagate to RobotDeployment's failure/stop handling.
+        Engine errors propagate through PolicyServer/RemotePolicy to the robot
+        deployment's failure/stop handling; this process never controls hardware.
         """
         with self._lock:
             if self._close_requested.is_set():
@@ -217,6 +219,17 @@ class Pi05Policy:
                 if self._close_requested.is_set():
                     self._close_engine()
 
+    def reset_run(self) -> None:
+        """Restart the CPU noise stream once per client run, under the engine lock.
+
+        The first draw belongs to the discarded warmup. Do not call this before
+        each predict or repeated chunks would reuse the same initial noise.
+        """
+        with self._lock:
+            if self._close_requested.is_set():
+                raise RuntimeError("Pi05Policy is closed")
+            self._generator.manual_seed(self._seed)
+
     def _close_engine(self) -> None:
         """Release the engine once; the caller must already hold self._lock."""
         if not self._closed:
@@ -226,8 +239,9 @@ class Pi05Policy:
     def close(self) -> None:
         """Do not destroy CUDA resources underneath a timed-out predictor.
 
-        Hardware is stopped before this call. If inference is still active,
-        the worker releases its own engine in predict's finally block.
+        The model application calls this when its server exits; robot resource
+        cleanup belongs to the separate client. If inference is still active,
+        its caller releases the engine in predict's finally block.
         """
         # Set the event before attempting the lock so no later predict call can
         # start. A nonblocking acquire avoids extending hardware-shutdown waits.

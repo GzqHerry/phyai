@@ -14,6 +14,7 @@ from .types import (
     ObservationSchema,
     ObservationNotReady,
 )
+from ._compat import BaseExceptionGroup
 from .validation import (
     freeze_values,
     freeze_samples,

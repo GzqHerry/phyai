@@ -1,0 +1,13 @@
+# Model-side configuration. This process does not connect to a robot.
+embodiment: agilex
+task: Place the red cube on the green cube.
+endpoint: tcp://127.0.0.1:5555
+policy:
+  checkpoint: ???
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42
+  num_inference_steps: null
+  use_cuda_graph: true
+  num_threads: 16
+camera_height: 480
+camera_width: 640

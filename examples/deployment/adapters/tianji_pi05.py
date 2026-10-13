@@ -19,7 +19,7 @@ from phyai_robot import Action, ActionChunk, Observation
 from numpy.typing import NDArray
 
 from ..policies import Pi05PolicyRequest
-from ..robots.tianji import ARM_DOF, GRIPPER_FEEDBACK_SIZE, resize_rgb
+from ..layouts.tianji import ARM_DOF, GRIPPER_FEEDBACK_SIZE, resize_rgb
 
 # Dataset layout, shared by state and decoded actions:
 # [left joints 0:7, left gripper 7, right joints 8:15, right gripper 15].

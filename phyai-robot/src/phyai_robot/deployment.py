@@ -12,7 +12,7 @@ from __future__ import annotations
 import math
 import time
 import threading
-from typing import Any
+from typing import Any, Generic, TypeVar
 from _thread import LockType
 from collections import deque
 from dataclasses import dataclass
@@ -22,6 +22,7 @@ import numpy as np
 from .robot import Robot
 from .types import Action, ActionChunk, Observation, ActionSchema, ObservationNotReady
 from .policy import Policy, PolicyAdapter
+from ._compat import BaseExceptionGroup
 from .validation import (
     freeze_values,
     freeze_samples,
@@ -131,7 +132,11 @@ def _interpolate(
     return freeze_values(values)
 
 
-class RobotDeployment[RequestT, ResultT]:
+RequestT = TypeVar("RequestT")
+ResultT = TypeVar("ResultT")
+
+
+class RobotDeployment(Generic[RequestT, ResultT]):
     """Run one observation/inference worker and one independent control loop.
 
     A Condition protects queue contents, chunk timing and worker failures. The

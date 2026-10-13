@@ -1,0 +1,14 @@
+# Model-side configuration. This process does not connect to a robot.
+embodiment: tianji
+task: Plug in the Ethernet cable
+endpoint: tcp://127.0.0.1:5555
+policy:
+  checkpoint: ???
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42
+  num_inference_steps: null
+  use_cuda_graph: true
+  num_threads: 16
+adapter:
+  metadata_file: null
+  gripper_limits_rad: [0.0, 1.6]

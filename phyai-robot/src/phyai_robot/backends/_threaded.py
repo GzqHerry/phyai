@@ -22,6 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from ..types import Action, Sample
+from .._compat import BaseExceptionGroup
 from ..validation import freeze_values, freeze_samples
 
 

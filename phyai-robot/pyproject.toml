@@ -2,8 +2,8 @@
 name = "phyai-robot"
 dynamic = ["version"]
 description = "Robot interfaces, transport backends, and deployment loops"
-requires-python = ">=3.12"
-dependencies = ["numpy"]
+requires-python = ">=3.10"
+dependencies = ["numpy", "exceptiongroup>=1.2; python_version < '3.11'"]
 
 [project.optional-dependencies]
 zmq = ["pyzmq>=26"]
@@ -25,3 +25,7 @@ packages = ["src/phyai_robot"]
 addopts = ["-ra", "--import-mode=importlib"]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.ruff]
+extend = "../pyproject.toml"
+target-version = "py310"

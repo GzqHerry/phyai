@@ -25,10 +25,12 @@ class FeatureSpec:
     frame: str | None = None  # Reference frame for spatial values, when relevant.
 
 
+# Field name -> specification. Observations, commands and model inputs all use it.
+Schema: TypeAlias = Mapping[str, FeatureSpec]
 # Sensor names and layouts are independent of the physical robot structure.
-ObservationSchema: TypeAlias = Mapping[str, FeatureSpec]
+ObservationSchema: TypeAlias = Schema
 # Command fields describe exactly one control tick.
-ActionSchema: TypeAlias = Mapping[str, FeatureSpec]
+ActionSchema: TypeAlias = Schema
 # Dtypes can differ between fields; FeatureSpec validates each array at runtime.
 Action: TypeAlias = Mapping[str, NDArray[Any]]
 

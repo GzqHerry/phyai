@@ -1,12 +1,13 @@
 """Optional model RPC. Importing this module does not load ZMQ, ROS or Torch."""
 
 from ._wire import PROTOCOL_VERSION, PolicySpec
-from .policy import PolicyServer, RemotePolicy, RemotePolicyError
+from .policy import ModelPolicy, PolicyServer, RemotePolicy, RemotePolicyError
 
 __all__ = [
-    "RemotePolicy",
-    "RemotePolicyError",
+    "ModelPolicy",
+    "PROTOCOL_VERSION",
     "PolicyServer",
     "PolicySpec",
-    "PROTOCOL_VERSION",
+    "RemotePolicy",
+    "RemotePolicyError",
 ]

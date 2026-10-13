@@ -1,13 +1,13 @@
-"""Protocol-v1 messages: one UTF-8 JSON frame followed by raw numeric frames.
+"""Protocol-v2 messages: one UTF-8 JSON frame followed by raw numeric frames.
 
 JSON describes shape, dtype (including byte order), field names and operation
 metadata. Each following frame is one array in C order. Both peers validate the
-protocol version and byte counts before reconstructing detached arrays, so they
-need no matching Python object layout, NumPy ABI, Torch or ROS installation.
+protocol version and byte counts before reconstructing arrays, so they need no
+matching Python object layout, NumPy ABI, Torch or ROS installation.
 
-Observations use one array per sensor field. Action chunks use one stacked array
-per action field with the prediction horizon as its leading dimension. Robot
-receive timestamps stay in the robot's monotonic clock domain throughout RPC.
+Requests and replies carry named model arrays, such as camera images and a
+state vector in, and an action matrix out. Robot field names, units and
+receive timestamps never cross the wire.
 """
 
 from __future__ import annotations
@@ -19,16 +19,17 @@ from dataclasses import field, dataclass
 from collections.abc import Mapping
 
 import numpy as np
+from numpy.typing import NDArray
 
-from ..types import Sample, ActionChunk, FeatureSpec, Observation
+from ..types import Schema, FeatureSpec
 from ..validation import validate_schema, validate_values
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 MAX_BYTES = 128 * 1024 * 1024
 
 
-def _schema(schema):
-    """Normalize a physical schema for exact JSON comparison on either peer."""
+def schema_to_json(schema: Schema) -> dict[str, Any]:
+    """Normalize a schema for exact JSON comparison on either peer."""
     validate_schema(schema)
     return {
         key: dict(
@@ -42,9 +43,8 @@ def _schema(schema):
     }
 
 
-def _read_schema(value):
-    """Rebuild field specifications; PolicySpec.from_dict validates them next."""
-    return {
+def schema_from_json(value: Mapping[str, Any]) -> dict[str, FeatureSpec]:
+    schema = {
         k: FeatureSpec(
             tuple(v["shape"]),
             v["dtype"],
@@ -54,84 +54,66 @@ def _read_schema(value):
         )
         for k, v in value.items()
     }
+    validate_schema(schema)
+    return schema
 
 
 @dataclass(frozen=True)
 class PolicySpec:
-    """Physical data contract plus model metadata needed before opening hardware.
+    """The model's input/output arrays plus descriptive metadata.
 
-    Schemas include units and coordinate order, not just tensor dimensions.
-    Metadata is application-owned (for example horizon and image size); it is
-    advertised by the server but is not part of the physical-schema equality
-    check. The entry point validates metadata needed to configure its robot.
+    Metadata is application-owned (for example horizon, image size and task);
+    clients use it to configure themselves before opening hardware.
     """
 
-    embodiment: str
-    observation_schema: Mapping[str, FeatureSpec]
-    action_schema: Mapping[str, FeatureSpec]
+    inputs: Schema
+    outputs: Schema
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return dict(
-            embodiment=self.embodiment,
-            observation_schema=_schema(self.observation_schema),
-            action_schema=_schema(self.action_schema),
+            inputs=schema_to_json(self.inputs),
+            outputs=schema_to_json(self.outputs),
             metadata=dict(self.metadata),
         )
 
     @classmethod
-    def from_dict(cls, value):
-        spec = cls(
-            value["embodiment"],
-            _read_schema(value["observation_schema"]),
-            _read_schema(value["action_schema"]),
-            value["metadata"],
+    def from_dict(cls, value: Mapping[str, Any]) -> PolicySpec:
+        return cls(
+            schema_from_json(value["inputs"]),
+            schema_from_json(value["outputs"]),
+            dict(value["metadata"]),
         )
-        spec.to_dict()
-        return spec
-
-    def check(self, embodiment, observation_schema, action_schema):
-        """Reject another embodiment or any physical field-contract mismatch."""
-        if embodiment != self.embodiment:
-            raise ValueError(f"embodiment mismatch: expected {self.embodiment}")
-        for label, actual, expected in (
-            ("observation", observation_schema, self.observation_schema),
-            ("action", action_schema, self.action_schema),
-        ):
-            if _schema(actual) != _schema(expected):
-                raise ValueError(f"{label} schema mismatch")
 
 
-def pack(meta, arrays=()):
-    """Copy numeric arrays into a bounded multipart message.
+def pack(meta: Mapping[str, Any], arrays: Any = ()) -> list[Any]:
+    """Build a bounded multipart message without copying array data.
 
-    Strided inputs retain their values and shape, including zero-dimensional
-    arrays. Object/string/complex arrays and non-finite JSON metadata are not
-    part of this protocol. Array finiteness is checked by the schema validators.
+    Array frames are byte views of C-contiguous arrays; send them with
+    copy=False and do not modify the arrays until the send completes.
+    Object/string/complex arrays and non-finite JSON metadata are rejected.
     """
     frames, descriptors = [], []
     for value in arrays:
         if not isinstance(value, np.ndarray) or value.dtype.kind not in "biuf":
             raise ValueError("wire values must be real numeric numpy arrays")
-        # tobytes(order='C') handles strides without changing scalar shape.
         descriptors.append(dict(shape=list(value.shape), dtype=value.dtype.str))
-        frames.append(value.tobytes())
+        frames.append(np.ascontiguousarray(value).reshape(-1).view(np.uint8).data)
     header = json.dumps(
         dict(meta, protocol=PROTOCOL_VERSION, arrays=descriptors),
         allow_nan=False,
         separators=(",", ":"),
     ).encode()
-    if len(header) + sum(map(len, frames)) > MAX_BYTES:
+    if len(header) + sum(frame.nbytes for frame in frames) > MAX_BYTES:
         raise ValueError("policy message exceeds size limit")
     return [header, *frames]
 
 
-def unpack(frames):
-    """Validate framing and return metadata plus independent NumPy arrays.
+def unpack(frames: Any) -> tuple[dict[str, Any], list[NDArray[Any]]]:
+    """Validate framing and return metadata plus arrays viewing the frames.
 
-    The shape/product check precedes reconstruction. Copies detach values from
-    transport buffers so later socket operations cannot alter an observation.
-    This validates the wire format; field/schema validation follows separately.
+    The shape/size check precedes reconstruction. Frames received as bytes are
+    immutable, so the arrays are read-only views and need no further copy.
     """
     if not frames or sum(map(len, frames)) > MAX_BYTES:
         raise ValueError("invalid policy message size")
@@ -153,67 +135,30 @@ def unpack(frames):
             raise ValueError("invalid array dtype or shape")
         if math.prod(shape) * dtype.itemsize != len(data):
             raise ValueError("array frame size mismatch")
-        arrays.append(np.frombuffer(data, dtype=dtype).reshape(shape).copy())
+        arrays.append(np.frombuffer(data, dtype=dtype).reshape(shape))
     return header, arrays
 
 
-def observation_payload(observation):
-    """Keep each field name and robot receive timestamp aligned with its frame."""
-    return dict(
-        samples=[
-            dict(key=k, received_at_ns=s.received_at_ns)
-            for k, s in observation.samples.items()
-        ]
-    ), [s.value for s in observation.samples.values()]
-
-
-def read_observation(header, arrays, schema):
-    """Reject duplicate/missing fields and reconstruct the original robot snapshot."""
-    descriptors = header["samples"]
-    if len(descriptors) != len(arrays) or len({d["key"] for d in descriptors}) != len(
-        arrays
-    ):
-        raise ValueError("observation field count mismatch")
-    samples = {}
-    for d, value in zip(descriptors, arrays):
-        stamp = d["received_at_ns"]
-        # These timestamps belong to the robot. Never compare to the server clock.
-        if type(stamp) is not int or stamp < 0:
-            raise ValueError("invalid robot receive timestamp")
-        samples[d["key"]] = Sample(value, stamp)
-    validate_values({k: s.value for k, s in samples.items()}, schema)
-    return Observation(samples)
-
-
-def chunk_payload(chunk, schema):
-    """Validate physical targets and stack each field over the full horizon."""
-    if not isinstance(chunk, ActionChunk) or not chunk.actions:
-        raise ValueError("expected nonempty ActionChunk")
-    if not math.isfinite(chunk.step_period_s) or chunk.step_period_s <= 0:
-        raise ValueError("invalid action period")
-    for action in chunk.actions:
-        validate_values(action, schema)
+def values_payload(
+    values: Mapping[str, NDArray[Any]], schema: Schema
+) -> tuple[dict[str, Any], list[NDArray[Any]]]:
+    """Validate named arrays against schema and order them for pack()."""
+    validate_values(values, schema)
     keys = list(schema)
-    return dict(keys=keys, step_period_s=chunk.step_period_s), [
-        np.stack([a[k] for a in chunk.actions]) for k in keys
-    ]
+    return dict(keys=keys), [values[key] for key in keys]
 
 
-def read_chunk(header, arrays, schema):
-    """Restore per-step actions; leave execution-prefix selection to deployment."""
-    keys = header["keys"]
+def read_values(
+    header: Mapping[str, Any], arrays: list[NDArray[Any]], schema: Schema
+) -> dict[str, NDArray[Any]]:
+    """Reject duplicate, missing or malformed fields and rebuild the mapping."""
+    keys = header.get("keys")
     if (
-        len(keys) != len(set(keys))
-        or set(keys) != set(schema)
+        not isinstance(keys, list)
+        or len(keys) != len(set(keys))
         or len(keys) != len(arrays)
     ):
-        raise ValueError("action field mismatch")
-    count = len(arrays[0]) if arrays else 0
-    if not count or any(len(a) != count for a in arrays):
-        raise ValueError("action horizon mismatch")
-    chunk = ActionChunk(
-        tuple({k: a[i].copy() for k, a in zip(keys, arrays)} for i in range(count)),
-        header["step_period_s"],
-    )
-    chunk_payload(chunk, schema)
-    return chunk
+        raise ValueError("array field mismatch")
+    values = dict(zip(keys, arrays))
+    validate_values(values, schema)
+    return values

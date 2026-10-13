@@ -40,10 +40,10 @@ class RemotePolicy:
 
     Call info/begin_run before enabling hardware, then warmup exactly once and
     discard its result. RobotDeployment may call predict on its worker thread.
-    Every RPC owns and closes its socket on the calling thread; a lock
-    serializes calls. Requests are never retried: a failed begin or prediction
-    invalidates this client. The server releases an abandoned run after its
-    lease expires.
+    One REQ socket is reused across calls; a lock serializes them, which also
+    provides the memory barrier ZMQ requires to move a socket between threads.
+    Requests are never retried: a failed begin or prediction invalidates this
+    client. The server releases an abandoned run after its lease expires.
     """
 
     def __init__(
@@ -58,8 +58,10 @@ class RemotePolicy:
         self.endpoint = endpoint
         self.timeout_s, self.warmup_timeout_s = timeout_s, warmup_timeout_s
         # close() never waits for a slow request. The closing event transfers
-        # end-run responsibility to the thread that owns the lock.
+        # end-run and socket cleanup to the thread that owns the lock.
         self._lock, self._closing = Lock(), Event()
+        self._context: Any = None
+        self._socket: Any = None
         self._run_id: str | None = None
         self._request_id = 0
         self._spec: PolicySpec | None = None
@@ -70,6 +72,26 @@ class RemotePolicy:
     def spec(self) -> PolicySpec | None:
         """The spec returned by begin_run, or None before a run starts."""
         return self._spec
+
+    def _connect(self) -> Any:
+        import zmq
+
+        if self._context is None:
+            self._context = zmq.Context()
+        if self._socket is None:
+            socket = self._context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            # Do not queue a request while no server is connected.
+            socket.setsockopt(zmq.IMMEDIATE, 1)
+            socket.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
+            socket.connect(self.endpoint)
+            self._socket = socket
+        return self._socket
+
+    def _disconnect(self) -> None:
+        if self._socket is not None:
+            self._socket.close(linger=0)
+            self._socket = None
 
     def _rpc(
         self,
@@ -98,28 +120,27 @@ class RemotePolicy:
         deadline = time.monotonic() + (
             self.timeout_s if timeout_s is None else timeout_s
         )
-        # No socket can outlive its caller or cross the warmup/worker seam.
-        with zmq.Context() as context:
-            with context.socket(zmq.REQ) as socket:
-                socket.setsockopt(zmq.LINGER, 0)
-                # Do not queue a request while no server is connected.
-                socket.setsockopt(zmq.IMMEDIATE, 1)
-                socket.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
-                socket.connect(self.endpoint)
+        socket = self._connect()
 
-                def wait(event: int) -> None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0 or not socket.poll(
-                        max(1, math.ceil(remaining * 1000)), event
-                    ):
-                        raise TimeoutError(
-                            f"policy {operation} timed out; request was not retried"
-                        )
+        def wait(event: int) -> None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not socket.poll(
+                max(1, math.ceil(remaining * 1000)), event
+            ):
+                raise TimeoutError(
+                    f"policy {operation} timed out; request was not retried"
+                )
 
-                wait(zmq.POLLOUT)
-                socket.send_multipart(frames, flags=zmq.DONTWAIT, copy=False)
-                wait(zmq.POLLIN)
-                response, values = unpack(socket.recv_multipart(flags=zmq.DONTWAIT))
+        try:
+            wait(zmq.POLLOUT)
+            socket.send_multipart(frames, flags=zmq.DONTWAIT, copy=False)
+            wait(zmq.POLLIN)
+            response, values = unpack(socket.recv_multipart(flags=zmq.DONTWAIT))
+        except BaseException:
+            # A REQ socket cannot send again until it receives a reply. Replace
+            # it so a later end/close cannot consume this request's late reply.
+            self._disconnect()
+            raise
         if response.get("request_id") != request_id:
             raise RemotePolicyError("policy response request ID mismatch")
         if operation != "begin" and response.get("run_id") != run_id:
@@ -195,18 +216,24 @@ class RemotePolicy:
                     self._shutdown()
 
     def _shutdown(self) -> None:
-        """Release the run once; the caller holds the lock.
+        """Release the run once and free sockets; the caller holds the lock.
 
         Release is best effort: if the server is unreachable or already dropped
         the run, its lease frees the server, so close() only logs the failure.
         """
-        if self._run_id is not None:
-            try:
-                self._rpc("end")
-            except Exception as error:  # noqa: BLE001 - the lease covers a failed release
-                logger.warning("Could not release run %s: %s", self._run_id, error)
-            finally:
-                self._run_id = None
+        try:
+            if self._run_id is not None:
+                try:
+                    self._rpc("end")
+                except Exception as error:  # noqa: BLE001 - the lease covers a failed release
+                    logger.warning("Could not release run %s: %s", self._run_id, error)
+                finally:
+                    self._run_id = None
+        finally:
+            self._disconnect()
+            if self._context is not None:
+                self._context.term()
+                self._context = None
 
     def close(self) -> None:
         """Call after robot stop/close; never destroys an in-flight request.

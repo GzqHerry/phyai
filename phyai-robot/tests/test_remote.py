@@ -281,6 +281,19 @@ def test_timeout_is_bounded_and_never_retried():
     client.close()
 
 
+def test_client_reuses_one_socket_until_a_request_fails():
+    with running() as (_, _, url):
+        client = RemotePolicy(url)
+        client.info()
+        first = client._socket
+        client.begin_run()
+        client.warmup(STATE)
+        client.predict(STATE)
+        assert client._socket is first
+        client.close()
+        assert client._socket is None and client._context is None
+
+
 def test_server_survives_malformed_message():
     import zmq
 

@@ -13,6 +13,7 @@ from .types import (
     ObservationNotReady,
 )
 from .policy import Policy, EnginePolicy, PolicyAdapter
+from .adapters import StateSlot, CommandSlot, VectorAdapter
 from .scheduling import Scheduler, StopAndRefill, InferenceContext
 from .deployment import RobotDeployment, DeploymentOptions
 
@@ -20,6 +21,7 @@ __all__ = [
     "Action",
     "ActionChunk",
     "ActionSchema",
+    "CommandSlot",
     "CompositeRobot",
     "DeploymentOptions",
     "EnginePolicy",
@@ -35,7 +37,9 @@ __all__ = [
     "Sample",
     "Scheduler",
     "Schema",
+    "StateSlot",
     "StopAndRefill",
+    "VectorAdapter",
     "take_snapshot",
     "wait_for_observation",
 ]

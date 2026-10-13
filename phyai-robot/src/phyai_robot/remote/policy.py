@@ -1,10 +1,11 @@
-"""Synchronous model RPC with a resident predictor and explicit run ownership."""
+"""Synchronous model RPC with a resident predictor and leased run ownership."""
 
 from __future__ import annotations
 
 import math
 import time
 import uuid
+import logging
 from typing import Any, Protocol
 from threading import Lock, Event
 from collections.abc import Mapping, Callable
@@ -19,6 +20,8 @@ from ._wire import (
     read_values,
     values_payload,
 )
+
+logger = logging.getLogger(__name__)
 
 Arrays = Mapping[str, NDArray[Any]]
 
@@ -39,7 +42,8 @@ class RemotePolicy:
     discard its result. RobotDeployment may call predict on its worker thread.
     Every RPC owns and closes its socket on the calling thread; a lock
     serializes calls. Requests are never retried: a failed begin or prediction
-    invalidates this client. close() releases the run after hardware stops.
+    invalidates this client. The server releases an abandoned run after its
+    lease expires.
     """
 
     def __init__(
@@ -191,10 +195,16 @@ class RemotePolicy:
                     self._shutdown()
 
     def _shutdown(self) -> None:
-        """Release the run once; forget ownership even if the request fails."""
+        """Release the run once; the caller holds the lock.
+
+        Release is best effort: if the server is unreachable or already dropped
+        the run, its lease frees the server, so close() only logs the failure.
+        """
         if self._run_id is not None:
             try:
                 self._rpc("end")
+            except Exception as error:  # noqa: BLE001 - the lease covers a failed release
+                logger.warning("Could not release run %s: %s", self._run_id, error)
             finally:
                 self._run_id = None
 
@@ -202,7 +212,7 @@ class RemotePolicy:
         """Call after robot stop/close; never destroys an in-flight request.
 
         If prediction is still running, its thread releases the run. A failed
-        release requires a manual server restart.
+        release leaves the run to the server's lease timeout.
         """
         self._closing.set()
         if self._lock.acquire(blocking=False):
@@ -223,6 +233,9 @@ class PolicyServer:
 
     reset_run resets the predictor's noise stream, not its engine. The
     application owns the predictor; this server owns only its ZMQ resources.
+    A run that sends no request for lease_timeout_s is released, so a crashed
+    or disconnected client cannot keep the model busy. Keep lease_timeout_s
+    larger than the client's longest gap between requests.
     Bind loopback unless a trusted remote robot explicitly needs network access.
     """
 
@@ -233,17 +246,34 @@ class PolicyServer:
         spec: PolicySpec,
         reset_run: Callable[[], None],
         endpoint: str = "tcp://127.0.0.1:5555",
+        lease_timeout_s: float = 60.0,
     ) -> None:
         spec.to_dict()
+        _positive("lease_timeout_s", lease_timeout_s)
         self.policy, self.spec = policy, spec
         self.reset_run, self.endpoint = reset_run, endpoint
+        self.lease_timeout_s = lease_timeout_s
         self._run_id: str | None = None
         self._last_request_id = -1
         self._warmed = False
+        self._lease_deadline = 0.0
 
     @property
     def run_id(self) -> str | None:
         return self._run_id
+
+    def expire_lease(self, now: float | None = None) -> bool:
+        """Release the active run if its lease has expired; return True if so."""
+        now = time.monotonic() if now is None else now
+        if self._run_id is None or now < self._lease_deadline:
+            return False
+        logger.warning(
+            "Releasing run %s after %.1f s without requests",
+            self._run_id,
+            self.lease_timeout_s,
+        )
+        self._run_id = None
+        return True
 
     def _dispatch(
         self, request: Mapping[str, Any], arrays: list[NDArray[Any]]
@@ -252,24 +282,30 @@ class PolicyServer:
 
         info never changes ownership. Every operation after begin must carry
         that run's ID and a newer request ID; replay cannot consume more noise.
-        Failures leave the run owned until end or a manual server restart.
+        Failures leave the run owned until end or lease expiry.
         """
         op, request_id = request["operation"], request["request_id"]
         if type(request_id) is not int or request_id < 1:
             raise ValueError("invalid request ID")
         if op == "info":
             return dict(spec=self.spec.to_dict()), [], request.get("run_id")
+        self.expire_lease()
         if op == "begin":
             if self._run_id is not None:
                 raise RuntimeError(
-                    "server already has an active run; end it or restart the server"
+                    "server already has an active run; wait for it to end or for "
+                    f"its {self.lease_timeout_s:g} s lease to expire"
                 )
             self.reset_run()
             self._run_id, self._warmed = uuid.uuid4().hex, False
             self._last_request_id = request_id
-            return dict(spec=self.spec.to_dict()), [], self._run_id
+            return (
+                dict(spec=self.spec.to_dict(), lease_timeout_s=self.lease_timeout_s),
+                [],
+                self._run_id,
+            )
         if self._run_id is None or request.get("run_id") != self._run_id:
-            raise ValueError("stale or unknown run ID")
+            raise ValueError("stale, expired or unknown run ID")
         if request_id <= self._last_request_id:
             raise ValueError("stale request ID")
         self._last_request_id = request_id
@@ -293,6 +329,8 @@ class PolicyServer:
         ready_event signals a successful bind, not a model warmup. Every
         consumed request gets one reply, including validation/model errors, so
         the REP socket can accept another request without changing ownership.
+        The lease is renewed after each reply, so long inference never counts
+        against it.
         """
         import zmq
 
@@ -306,8 +344,10 @@ class PolicyServer:
                     ready_event.set()
                 while not stop.is_set():
                     if not socket.poll(100, zmq.POLLIN):
+                        self.expire_lease()
                         continue
                     request: dict[str, Any] = {}
+                    run_id = None
                     try:
                         request, arrays = unpack(socket.recv_multipart())
                         meta, values, run_id = self._dispatch(request, arrays)
@@ -330,3 +370,6 @@ class PolicyServer:
                             )
                         )
                     socket.send_multipart(reply, copy=False)
+                    # Only successful requests from the owner renew its lease.
+                    if run_id is not None and run_id == self._run_id:
+                        self._lease_deadline = time.monotonic() + self.lease_timeout_s

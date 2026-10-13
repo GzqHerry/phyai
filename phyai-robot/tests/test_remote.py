@@ -49,7 +49,7 @@ class Predictor:
 
 
 @contextmanager
-def running():
+def running(lease_timeout_s=30.0):
     predictor = Predictor()
     stop, ready = Event(), Event()
     url = endpoint()
@@ -58,6 +58,7 @@ def running():
         spec=SPEC,
         reset_run=predictor.reset,
         endpoint=url,
+        lease_timeout_s=lease_timeout_s,
     )
     errors = []
 
@@ -202,6 +203,56 @@ def test_busy_server_does_not_reset_rng():
         assert predictor.resets == 1
         owner.warmup(STATE)
         owner.close()
+
+
+def test_abandoned_run_is_released_after_its_lease():
+    with running(lease_timeout_s=0.2) as (server, predictor, url):
+        crashed = RemotePolicy(url)
+        crashed.begin_run()
+        # The owner disappears without end(); a new client is refused at first.
+        other = RemotePolicy(url)
+        with pytest.raises(RemotePolicyError, match="active run"):
+            other.begin_run()
+        other.close()
+        deadline = time.monotonic() + 2
+        while server.run_id is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.run_id is None
+        replacement = RemotePolicy(url)
+        replacement.begin_run()
+        replacement.warmup(STATE)
+        assert predictor.resets == 2
+        # The old owner can no longer use the server, and closing it is harmless.
+        with pytest.raises(RemotePolicyError, match="run ID"):
+            crashed.warmup(STATE)
+        crashed.close()
+        assert server.run_id is not None
+        replacement.close()
+        assert server.run_id is None
+
+
+def test_regular_requests_keep_the_lease_alive():
+    with running(lease_timeout_s=0.3) as (server, _, url):
+        client = RemotePolicy(url)
+        client.begin_run()
+        client.warmup(STATE)
+        for _ in range(6):
+            time.sleep(0.1)
+            client.predict(STATE)
+        assert server.run_id is not None
+        client.close()
+        assert server.run_id is None
+
+
+def test_info_from_another_client_does_not_extend_the_lease():
+    server = PolicyServer(
+        policy=Predictor(), spec=SPEC, reset_run=lambda: None, lease_timeout_s=1
+    )
+    server._dispatch(dict(operation="begin", request_id=1), [])
+    server._lease_deadline = 0.0
+    _, _, run_id = server._dispatch(dict(operation="info", request_id=1), [])
+    assert run_id is None
+    assert server.expire_lease()
 
 
 def test_request_and_run_ids_reject_replay():

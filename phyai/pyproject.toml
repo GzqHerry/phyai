@@ -25,7 +25,7 @@ dependencies = [
 phyai = "phyai.cli:main"
 
 [project.optional-dependencies]
-deployment = ["phyai-robot"]
+deployment = ["phyai-robot[zmq,images]"]
 ext = ["phyai-ext"]
 fastokenizer = ["fastokens>=0.2.0"]
 

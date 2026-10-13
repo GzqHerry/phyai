@@ -1,5 +1,6 @@
 # Robot/client only. ROS Humble and sensor_msgs come from /opt/ros/humble.
 numpy==1.26.4
+Pillow==12.3.0
 pyzmq==27.2.0
 omegaconf==2.3.1
 PyYAML==6.0.3

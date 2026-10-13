@@ -34,7 +34,7 @@ phyai-robot = { workspace = true }
 [dependency-groups]
 deployment = [
     "omegaconf>=2.3,<2.4",
-    "phyai-robot",
+    "phyai-robot[zmq,images]",
 ]
 dev = [
     "pytest>=8",
@@ -57,6 +57,7 @@ testpaths = [
     "phyai-model-optimizer/tests",
     "phyai-utils-tools/tests",
     "phyai-robot/tests",
+    "examples/deployment/tests",
 ]
 pythonpath = [
     "phyai/src",

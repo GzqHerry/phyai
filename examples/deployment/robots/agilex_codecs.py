@@ -1,33 +1,30 @@
-"""AgileX joint/gripper layout bindings for standard ROS messages."""
+"""AgileX (Piper) JointState conversions; importing them never imports ROS."""
+
+from __future__ import annotations
+
+from typing import Any
 
 import numpy as np
-from phyai_robot.backends.ros2.codecs import decode_joint_positions, decode_rgb_image
+from numpy.typing import NDArray
+from phyai_robot.backends.ros2.codecs import decode_joint_positions
 
-from ..layouts.agilex import JOINT_NAMES
-
-# Kept as an import alias for callers using the deployment image decoder.
-decode_image = decode_rgb_image
-
-
-def decode_joint_state(message):
-    """Select joint0..joint6, preserving driver radians and gripper meters."""
-    return decode_joint_positions(message, JOINT_NAMES)
+# Six arm joints followed by the gripper, as published by the Piper driver.
+JOINT_NAMES = tuple(f"joint{i}" for i in range(7))
 
 
-def decode_state_fields(message, side):
+def decode_arm(message: Any, side: str) -> dict[str, NDArray[np.float64]]:
     """Split one seven-value feedback into six arm joints and one gripper."""
-    values = decode_joint_state(message)
+    values = decode_joint_positions(message, JOINT_NAMES)
     return {
         f"joint_position_{side}": values[:6].copy(),
         f"gripper_{side}": values[6:].copy(),
     }
 
 
-def encode_state_fields(values, side, message_type):
-    """Join the physical fields without clipping, scaling or changing joint order.
+def encode_arm(values: Any, side: str, message_type: type[Any]) -> Any:
+    """Join radians and gripper meters without clipping, scaling or reordering.
 
-    The backend supplies the ROS timestamp after encoding. Keeping the message
-    class injected lets offline tests exercise this mapping without importing ROS.
+    The backend stamps the header just before publishing.
     """
     message = message_type()
     message.name = list(JOINT_NAMES)

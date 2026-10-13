@@ -315,17 +315,19 @@ def test_adapter_receives_the_request_observation():
 def test_client_rejects_mismatched_reply(field, value):
     import zmq
 
-    url = endpoint()
-    ready = Event()
+    urls = []
+    ready, answered = Event(), Event()
     errors = []
 
     def fake_server():
         try:
             with zmq.Context() as context, context.socket(zmq.REP) as sock:
                 sock.setsockopt(zmq.LINGER, 0)
-                sock.bind(url)
+                # Bind directly: a probed-then-released port can be taken first.
+                port = sock.bind_to_random_port("tcp://127.0.0.1")
+                urls.append(f"tcp://127.0.0.1:{port}")
                 ready.set()
-                assert sock.poll(2000)
+                assert sock.poll(5000)
                 request, _ = unpack(sock.recv_multipart())
                 response = dict(
                     ok=True,
@@ -335,20 +337,24 @@ def test_client_rejects_mismatched_reply(field, value):
                 )
                 response[field] = value
                 sock.send_multipart(pack(response))
+                # LINGER=0 drops unsent replies on close; keep the socket open
+                # until the client has its answer.
+                assert answered.wait(5)
         except BaseException as error:
             errors.append(error)
             ready.set()
 
     thread = Thread(target=fake_server)
     thread.start()
-    client = RemotePolicy(url)
+    assert ready.wait(2) and urls, errors
+    client = RemotePolicy(urls[0], timeout_s=5)
     try:
-        assert ready.wait(2)
         with pytest.raises(RemotePolicyError, match="ID mismatch"):
             client.info()
     finally:
+        answered.set()
         client.close()
-        thread.join(3)
+        thread.join(6)
     assert not thread.is_alive() and not errors
 
 

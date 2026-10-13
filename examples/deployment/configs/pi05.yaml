@@ -1,0 +1,18 @@
+# Generic pi0.5 server defaults. Select a checkpoint-specific file with --config.
+task: ""
+endpoint: tcp://127.0.0.1:5555
+lease_timeout_s: 60.0  # Release a run after this long without client requests.
+
+policy:
+  checkpoint: ???  # Required local export directory.
+  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
+  seed: 42  # CPU noise stream, reset at the start of every client run.
+  num_inference_steps: null  # null keeps the checkpoint's Euler step count.
+  use_cuda_graph: true
+  num_threads: 16
+
+processor:
+  camera_names: null  # Model camera order; required for lerobot-style exports.
+  action_dim: null  # Required for lerobot-style exports.
+  metadata_file: null  # Metadata JSON relative to the checkpoint; null discovers it.
+  image_resize_backend: pil

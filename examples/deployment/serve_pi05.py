@@ -1,8 +1,14 @@
-"""Resident Pi05 server: adapter preprocessing -> PhyAI -> physical ActionChunk.
+"""Resident pi0.5 server: model arrays -> preprocessing -> PhyAI -> actions.
 
-This entry point never imports ROS or creates a robot. Start the corresponding
-robot-only client separately. Each begin_run resets noise and requires exactly
-one discarded warmup. Only one robot run may own the server at a time.
+The server knows the checkpoint, never the robot: it imports no ROS, robot
+schema or calibration. Robot clients map their sensors to the advertised
+inputs and the returned action vectors to their commands. Each run resets the
+noise stream and starts with one discarded warmup. One run owns the server at
+a time; a run that stops sending requests is released after its lease.
+
+    python -m examples.deployment.serve_pi05 \\
+        --config examples/deployment/configs/pi05_tianji.yaml \\
+        policy.checkpoint=/path/to/checkpoint
 """
 
 from __future__ import annotations
@@ -15,75 +21,35 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     __package__ = "examples.deployment"
 
-from phyai_robot.remote import PolicySpec, PolicyServer
+from phyai_robot.remote import PolicyServer
 
-from .policies import Pi05Policy, Pi05PolicyConfig
+from .pi05 import Pi05Policy, Pi05Processing, Pi05PolicyConfig, Pi05ProcessorConfig
 from .configuration import parse_config, repository_path
-from .adapters.tianji_pi05 import TianjiPi05AdapterConfig
 
-DEFAULT_CONFIG = Path(__file__).with_name("configs") / "pi05_agilex.yaml"
+DEFAULT_CONFIG = Path(__file__).with_name("configs") / "pi05.yaml"
 
 
 @dataclass
 class Pi05ServerConfig:
-    """Model-process settings, separate from control rate and execution horizon.
+    """Model-process settings; robot timing and calibration live in the client."""
 
-    checkpoint and task are required at startup. AgileX camera dimensions define
-    its raw observation contract; Tianji obtains resized image_size from its
-    processor. A running server keeps these settings fixed across client runs.
-    """
-
-    embodiment: str = "agilex"
     task: str = ""
     endpoint: str = "tcp://127.0.0.1:5555"
+    # Release a run after this long without requests from its client.
+    lease_timeout_s: float = 60.0
     policy: Pi05PolicyConfig = field(default_factory=Pi05PolicyConfig)
-    adapter: TianjiPi05AdapterConfig = field(default_factory=TianjiPi05AdapterConfig)
-    camera_height: int = 480
-    camera_width: int = 640
+    processor: Pi05ProcessorConfig = field(default_factory=Pi05ProcessorConfig)
 
-    def validate(self):
-        if self.embodiment not in ("agilex", "tianji"):
-            raise ValueError("embodiment must be agilex or tianji")
+    def validate(self) -> None:
         if not self.task.strip() or not self.endpoint.strip():
             raise ValueError("task and endpoint must not be empty")
-        if min(self.camera_height, self.camera_width) < 1:
-            raise ValueError("camera dimensions must be positive")
+        if self.lease_timeout_s <= 0:
+            raise ValueError("lease_timeout_s must be positive")
         self.policy.validate()
-        if self.embodiment == "tianji":
-            self.adapter.validate(execution_horizon=50)
+        self.processor.validate()
 
 
-def build_adapter(config):
-    """Pair model preprocessing with a pure physical schema, without robot I/O.
-
-    Return the adapter and handshake metadata. Import layouts rather than robot
-    factories so a GPU host never needs ROS just to learn joint order or units.
-    """
-    checkpoint = repository_path(config.policy.checkpoint)
-    if config.embodiment == "agilex":
-        from .layouts.agilex import ACTION_SCHEMA, observation_schema
-        from .adapters.agilex_pi05 import AgilexPi05Adapter
-
-        adapter = AgilexPi05Adapter(checkpoint, task=config.task)
-        schema = observation_schema(config.camera_height, config.camera_width)
-        metadata = dict(horizon=adapter.horizon)
-    else:
-        from .layouts.tianji import ACTION_SCHEMA, observation_schema
-        from .adapters.tianji_pi05 import ACTION_HORIZON, TianjiPi05Adapter
-
-        adapter = TianjiPi05Adapter(
-            checkpoint,
-            task=config.task,
-            metadata_file=config.adapter.metadata_file,
-            gripper_limits_rad=tuple(config.adapter.gripper_limits_rad),
-        )
-        schema = observation_schema(adapter.image_size)
-        metadata = dict(horizon=ACTION_HORIZON, image_size=adapter.image_size)
-    metadata.update(task=config.task, seed=config.policy.seed)
-    return adapter, PolicySpec(config.embodiment, schema, ACTION_SCHEMA, metadata)
-
-
-def main(argv=None):
+def main(argv=None) -> None:
     """Load once, serve many sequential robot runs, close the engine on exit."""
     config = parse_config(
         Pi05ServerConfig,
@@ -91,28 +57,24 @@ def main(argv=None):
         argv=argv,
         validate=Pi05ServerConfig.validate,
     )
-    adapter, spec = build_adapter(config)
-    policy = Pi05Policy(
-        repository_path(config.policy.checkpoint),
-        kernel_policy=repository_path(config.policy.kernel_policy),
-        seed=config.policy.seed,
-        num_inference_steps=config.policy.num_inference_steps,
-        use_cuda_graph=config.policy.use_cuda_graph,
-        num_threads=config.policy.num_threads,
-    )
+    checkpoint = repository_path(config.policy.checkpoint)
+    processing = Pi05Processing(checkpoint, task=config.task, config=config.processor)
+    policy = Pi05Policy(config.policy, processing)
     try:
-        spec.metadata["num_inference_steps"] = policy.num_inference_steps
-        # begin_run resets only the noise stream, not weights or CUDA graphs.
-        # The application owns model cleanup; the generic server owns sockets.
+        spec = policy.spec(
+            {**processing.metadata, "task": processing.task, "seed": config.policy.seed}
+        )
         server = PolicyServer(
             policy=policy,
-            adapter=adapter,
             spec=spec,
             reset_run=policy.reset_run,
             endpoint=config.endpoint,
+            lease_timeout_s=config.lease_timeout_s,
         )
         print(
-            f"Pi05 {config.embodiment} server: {config.endpoint}; task={config.task!r}; denoise_steps={policy.num_inference_steps}",
+            f"pi0.5 server on {config.endpoint}: task={processing.task!r}, "
+            f"cameras={processing.camera_names}, action_dim={processing.action_dim}, "
+            f"horizon={policy.horizon}, denoise_steps={policy.num_inference_steps}",
             flush=True,
         )
         server.serve()

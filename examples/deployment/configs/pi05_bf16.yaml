@@ -1,8 +1,9 @@
-# Static BF16 deployment with exact GELU semantics for the pi0.5 MLPs.
-# These overrides preserve checkpoint inference behavior rather than silently
-# substituting a tanh-approximate GELU implementation.
-# This file selects operator implementations; policies.py selects BF16 weights.
-# It does not configure action timing, ROS transport, or the execution horizon.
+# Static kernel selection for the pi0.5 model server.
+# The pi0.5 model requests exact GELU; these rules pin the kernels the engine
+# would choose for it and make an unavailable kernel an error at startup rather
+# than a silent fallback. The rules select implementations, not semantics: a
+# checkpoint trained with tanh-approximate GELU still runs with exact GELU.
+# Action timing and robot transport are configured by the robot client.
 schema: phyai.kernel/v1
 profile: static
 defaults:

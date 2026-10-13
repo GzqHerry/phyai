@@ -77,17 +77,9 @@ reported **811 loaded, zero missing, zero unexpected**.
 Source `full_weights.pt` SHA-256:
 `7b8570c93724035adbd02abd4b170e5de7a7969f7b5d2db3a38f01833ec7945a`.
 
-The reference used RLinf revision
-`805858b84a33e74b6c8e3a05b5c96379a61224cf` with the existing local Tianji SFT
-changes, its installed environment, the saved training configuration, and
-`get_model(...).sample_actions(..., num_steps=5, noise=...)`. The exact local
-source snapshot was recorded in a content manifest because the revision alone
-does not describe those local changes. Reference source contents were unchanged;
-no packages were installed, removed, or reconfigured. Importing `numpydantic`
-refreshed a generated type stub, so its original timestamp was restored and
-a write guard was added to the local reference scripts. The final environment
-check compares file sizes and modification times against the initial snapshot.
-Conversion helpers and model comparison scripts remain local.
+The reference was RLinf's own `sample_actions(..., num_steps=5, noise=...)`
+with the saved training configuration. Conversion and comparison scripts are
+not part of this repository.
 
 ## Validation results
 

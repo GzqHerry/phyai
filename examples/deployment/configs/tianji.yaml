@@ -8,6 +8,11 @@ robot:
   velocity_ratio: null  # Controller percentage [1, 100]; null leaves it unchanged.
   service_timeout_s: 3.0  # End-to-end budget per controller service call.
   gripper_limits_rad: [0.0, 1.6]  # Closed/open feedback position; set to the hardware calibration.
+  # mosaic: H.264 preview of the undistorted cameras.
+  # raw: individual undistorted NV12 topics.
+  camera_source: mosaic
+  camera_size: null  # Set [height, width] to reproduce the checkpoint training geometry.
+  mosaic_max_rate_hz: 15.0  # Converted frames per second; all frames are decoded.
 
 remote:
   endpoint: tcp://127.0.0.1:5555
@@ -23,5 +28,5 @@ control:
 
 schedule:
   strategy: stop_and_refill
-  action_hz: 25.0  # The checkpoint's 40 ms target spacing (action_stride 2 at 50 Hz).
+  action_hz: 25.0  # Target execution rate; select it for the checkpoint and desired playback speed.
   execution_horizon: 20  # 20 targets at 25 Hz: each chunk executes for 0.8 s.

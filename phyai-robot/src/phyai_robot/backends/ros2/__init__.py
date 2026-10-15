@@ -1,4 +1,4 @@
-"""Explicit opt-in ROS2 backend; importing it does not initialize ROS."""
+"""Explicit opt-in ROS2 backend; importing it does not initialize ROS or PyAV."""
 
 from .backend import (
     RosCommand,

@@ -399,3 +399,19 @@ def test_pose_and_wrench_decoders_flatten_in_documented_order():
     wrench = SimpleNamespace(wrench=SimpleNamespace(force=vector, torque=vector))
     np.testing.assert_array_equal(decode_pose(pose), [1, 2, 3, 4, 5, 6, 7])
     np.testing.assert_array_equal(decode_wrench(wrench), [1, 2, 3, 1, 2, 3])
+
+
+def test_decoder_returning_none_caches_nothing(fake_ros):
+    backend = Ros2Backend(
+        observations={"q": RosObservation("/q", object, lambda m: m)}, actions={}
+    )
+    try:
+        backend.connect()
+        fake_ros.feed("/q", None)
+        assert "q" not in backend.read()
+        fake_ros.feed("/q", np.array([1.0]))
+        first = backend.read()["q"]
+        fake_ros.feed("/q", None)
+        assert backend.read()["q"] is first  # The old sample keeps its timestamp.
+    finally:
+        backend.close()

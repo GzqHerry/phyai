@@ -48,7 +48,7 @@ def ros_messages(monkeypatch):
 
     for package, classes in {
         "std_msgs": ["Float32", "Float32MultiArray"],
-        "sensor_msgs": ["Image", "JointState"],
+        "sensor_msgs": ["Image", "CompressedImage", "JointState"],
         "geometry_msgs": ["PoseStamped", "WrenchStamped"],
         "marvin_msgs": ["JointcmdArm", "Jointfeedback"],
     }.items():

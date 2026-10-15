@@ -4,6 +4,10 @@ Data flow: ROS message -> decoder -> cached Sample -> Observation -> adapter ->
 model state/images; model action rows -> adapter -> complete Action -> one
 publication per arm and gripper. RobotDeployment owns timing and interpolation.
 
+Cameras can come from an H.264 preview mosaic or individual NV12 topics.
+The configured tile size can reproduce recording geometry before letterboxing
+images to the model input size.
+
 Before commands are routed, activate() calls set_ready, set_mode, optional
 set_vel_ratio and finally set_input(3) (User/Custom joint input). Stopping the
 robot calls set_input(0). It never homes the arms, restores a previous mode or
@@ -25,7 +29,7 @@ from phyai_robot import (
     VectorAdapter,
     CompositeRobot,
 )
-from phyai_robot.images import resize_with_pad
+from phyai_robot.images import resize, resize_with_pad
 from phyai_robot.remote import PolicySpec, Embodiment
 from phyai_robot.backends.ros2 import (
     RosCommand,
@@ -33,6 +37,7 @@ from phyai_robot.backends.ros2 import (
     RosObservation,
     image_backends,
 )
+from phyai_robot.backends.ros2.video import H264Decoder, MosaicDecoder
 from phyai_robot.backends.ros2.backend import SERVICE_POLL_MARGIN_S
 from phyai_robot.backends.ros2.codecs import (
     POSE_NAMES,
@@ -56,6 +61,7 @@ MODE_JOINT_POSITION = 1
 MODE_JOINT_IMPEDANCE = 3
 INPUT_IDLE = 0
 INPUT_USER = 3
+CAMERA_SOURCES = ("mosaic", "raw")
 JOINT_NAMES = tuple(f"joint_{index}" for index in range(1, ARM_DOF + 1))
 GRIPPER_FEEDBACK_NAMES = (
     "position",
@@ -92,12 +98,29 @@ class TianjiConfig:
     io_timeout_s: float = 0.1
     # Gripper feedback [closed, open] in motor radians; maps model state to [0, 1].
     gripper_limits_rad: list[float] = field(default_factory=lambda: [0.0, 1.6])
-    # Observation field -> NV12 image topic.
+    # "mosaic": decode the H.264 preview mosaic; "raw": per-camera NV12 images.
+    camera_source: str = "mosaic"
+    # Each camera image is resized to this [height, width] before letterboxing,
+    # matching training geometry when specified; null keeps its aspect ratio.
+    camera_size: list[int] | None = None
+    # H.264 mosaic of the undistorted cameras and each field's [row, column].
+    mosaic_topic: str = "/quad_tile/compressed_undistorted"
+    mosaic_grid: list[int] = field(default_factory=lambda: [2, 2])
+    mosaic_tiles: dict[str, list[int]] = field(
+        default_factory=lambda: {
+            "head_camera": [0, 0],
+            "left_wrist_camera": [1, 0],
+            "right_wrist_camera": [1, 1],
+        }
+    )
+    # Converted mosaic frames per second; every access unit is still decoded.
+    mosaic_max_rate_hz: float = 15.0
+    # Observation field -> undistorted NV12 topic, used by camera_source: raw.
     camera_topics: dict[str, str] = field(
         default_factory=lambda: {
-            "head_camera": "/camera/left_eye/image_nv12",
-            "left_wrist_camera": "/camera/left_wrist/image_nv12",
-            "right_wrist_camera": "/camera/right_wrist/image_nv12",
+            "head_camera": "/camera/left_eye/image_nv12_undistorted",
+            "left_wrist_camera": "/camera/left_wrist/image_nv12_undistorted",
+            "right_wrist_camera": "/camera/right_wrist/image_nv12_undistorted",
         }
     )
     # Model camera name -> observation field.
@@ -150,8 +173,27 @@ class TianjiConfig:
         low, high = self.gripper_limits_rad
         if not np.isfinite((low, high)).all() or low >= high:
             raise ValueError("robot.gripper_limits_rad must be finite and increasing")
-        if not set(self.model_cameras.values()) <= set(self.camera_topics):
-            raise ValueError("robot.model_cameras must name camera_topics fields")
+        if self.camera_source not in CAMERA_SOURCES:
+            raise ValueError(f"robot.camera_source must be one of {CAMERA_SOURCES}")
+        if self.camera_size is not None and (
+            len(self.camera_size) != 2 or min(self.camera_size) < 1
+        ):
+            raise ValueError("robot.camera_size must be [height, width] or null")
+        if len(self.mosaic_grid) != 2 or min(self.mosaic_grid) < 1:
+            raise ValueError("robot.mosaic_grid must be [rows, columns]")
+        rows, columns = self.mosaic_grid
+        tiles = [tuple(tile) for tile in self.mosaic_tiles.values()]
+        if len(set(tiles)) != len(tiles) or any(
+            len(tile) != 2 or not (0 <= tile[0] < rows and 0 <= tile[1] < columns)
+            for tile in tiles
+        ):
+            raise ValueError("robot.mosaic_tiles must name distinct grid cells")
+        if not self.mosaic_max_rate_hz > 0:
+            raise ValueError("robot.mosaic_max_rate_hz must be positive")
+        if not set(self.model_cameras.values()) <= set(camera_fields(self)):
+            raise ValueError(
+                f"robot.model_cameras must name {self.camera_source} camera fields"
+            )
         for attr in (
             "gripper_feedback_topics",
             "joint_command_topics",
@@ -175,6 +217,25 @@ class TianjiConfig:
             raise ValueError(f"robot.qos is missing {sorted(missing)}")
 
 
+def camera_fields(config: TianjiConfig) -> list[str]:
+    """Observation fields provided by the selected camera source."""
+    if config.camera_source == "mosaic":
+        return list(config.mosaic_tiles)
+    return list(config.camera_topics)
+
+
+def camera_transform(config: TianjiConfig, image_size: int):
+    """Reshape one full camera image like the recorded training tiles."""
+    size = config.camera_size
+
+    def transform(image: np.ndarray) -> np.ndarray:
+        if size is not None:
+            image = resize(image, int(size[0]), int(size[1]))
+        return resize_with_pad(image, image_size)
+
+    return transform
+
+
 ACTION_SCHEMA = {
     **{
         f"joint_position_{side}": FeatureSpec(
@@ -195,7 +256,7 @@ def observation_schema(config: TianjiConfig, image_size: int) -> dict[str, Featu
     """Camera fields use the model's square image size; decoders resize to it."""
     schema = {
         key: FeatureSpec((image_size, image_size, 3), "uint8")
-        for key in config.camera_topics
+        for key in camera_fields(config)
     }
     for side in SIDES:
         schema[f"joint_position_{side}"] = ACTION_SCHEMA[f"joint_position_{side}"]
@@ -296,7 +357,7 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
     """Compose the robot, adapter and controller without any ROS I/O."""
     from std_msgs.msg import Float32, Float32MultiArray
     from marvin_msgs.msg import JointcmdArm, Jointfeedback
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, CompressedImage
     from geometry_msgs.msg import PoseStamped, WrenchStamped
 
     image_size = int(spec.metadata["image_size"])
@@ -347,14 +408,36 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
         stop_timeout_s=config.service_timeout_s + SERVICE_POLL_MARGIN_S,
         **ros,
     )
-    cameras = image_backends(
-        config.camera_topics,
-        message_type=Image,
-        decode=lambda message: resize_with_pad(decode_nv12_image(message), image_size),
-        node_name=config.node_name,
-        qos=qos["camera"],
-        **ros,
-    )
+    transform = camera_transform(config, image_size)
+    if config.camera_source == "mosaic":
+        # One worker decodes the whole stream; the tiles share a frame and time.
+        mosaic = MosaicDecoder(
+            tiles={key: tuple(tile) for key, tile in config.mosaic_tiles.items()},
+            grid=tuple(config.mosaic_grid),
+            transform=transform,
+            decoder=H264Decoder(max_rate_hz=config.mosaic_max_rate_hz),
+        )
+        cameras = [
+            Ros2Backend(
+                observations={
+                    mosaic.fields: RosObservation(
+                        config.mosaic_topic, CompressedImage, mosaic, qos["camera"]
+                    )
+                },
+                actions={},
+                node_name=f"{config.node_name}_cameras",
+                **ros,
+            )
+        ]
+    else:
+        cameras = image_backends(
+            config.camera_topics,
+            message_type=Image,
+            decode=lambda message: transform(decode_nv12_image(message)),
+            node_name=config.node_name,
+            qos=qos["camera"],
+            **ros,
+        )
     schema = observation_schema(config, image_size)
     robot = CompositeRobot(
         observation_schema=schema,

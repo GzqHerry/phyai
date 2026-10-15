@@ -9,6 +9,8 @@ dependencies = ["numpy", "exceptiongroup>=1.2; python_version < '3.11'"]
 zmq = ["pyzmq>=26"]
 # Model-size camera images for decoders (phyai_robot.images).
 images = ["Pillow>=10"]
+# H.264 camera streams (phyai_robot.backends.ros2.video).
+video = ["av>=14"]
 # ROS middleware and rclpy must be provided by a compatible ROS installation.
 ros2 = []
 

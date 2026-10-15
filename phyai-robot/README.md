@@ -439,6 +439,18 @@ decoders can cache small images. `image_backends(...)` builds one backend per
 camera so slow image decoding never delays another camera or a command worker.
 Keep robot-specific joint/gripper layouts in the deployment bindings.
 
+Multi-megabyte raw images often lose UDP fragments in DDS. When a camera
+pipeline also publishes H.264 as `sensor_msgs/CompressedImage`, decode that
+stream instead with `backends.ros2.video` (the `video` extra, PyAV).
+`H264Decoder` decodes every access unit in order and uses the slice-header
+`frame_num` to detect a lost reference picture. It returns `None` from that
+loss until the next IDR, because FFmpeg does not flag such damaged frames. A
+decoder that returns `None` caches nothing for that message, so the previous
+sample keeps aging and the deployment's freshness check pauses inference
+instead of using a damaged image. `MosaicDecoder` splits a grid of cameras
+into named tiles from one frame; bind it to a tuple key so the tiles share a
+receive timestamp.
+
 `call_service(type, name, request, timeout_s=...)` runs a ROS service call on the
 backend's worker with one end-to-end deadline and raises on `success == False`.
 The `on_stop` callback receives the backend, runs on its worker and is bounded

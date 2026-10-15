@@ -46,19 +46,48 @@ config, not changing the server.
 Tianji gripper state is the feedback position mapped from
 `robot.gripper_limits_rad` to [0, 1] on the robot; gripper commands are clamped
 to [0, 1]. Cameras are decoded and letterboxed to the model's image size on the
-robot, one worker per camera, with the same PIL arithmetic as the server.
+robot with the same PIL arithmetic as the server.
+
+### Tianji cameras
+
+`robot.camera_source` selects how Tianji images reach the client:
+
+| Source | Default topic | Processing |
+|---|---|---|
+| `mosaic` | `/quad_tile/compressed_undistorted` | One H.264 decoder; selected tiles share a frame and receive timestamp |
+| `raw` | `/camera/<name>/image_nv12_undistorted` | One NV12 decoder worker per camera |
+
+Topics, mosaic grid and tile coordinates are configurable. Compressed streams
+reduce DDS bandwidth compared with full-resolution raw images. Measure delivery
+latency and frame loss on the deployment host before choosing freshness limits.
+
+Every H.264 access unit is decoded in order. `robot.mosaic_max_rate_hz` limits
+RGB conversion without skipping decoder reference updates. A missing reference
+picture can damage subsequent frames without an FFmpeg error. The decoder
+checks `frame_num` continuity and withholds output until the next IDR after a
+detected gap. Cached samples keep aging during recovery. Freshness is checked
+before the next inference; it does not interrupt an already executing chunk.
+Recovery time depends on the source encoder's keyframe interval.
+
+`robot.camera_size` optionally resizes each complete tile to `[height, width]`
+before letterboxing. Set it to reproduce the checkpoint's recorded image
+geometry. For example, a recording stretched to 960x540 needs `[540, 960]`:
+its content becomes 224x126 with 49 black rows above and below in a 224x224 model
+input. The default `null` preserves the decoded tile's aspect ratio. Deployment
+does not apply training-time random crops, rotations or color jitter.
 
 ## Supported robot profiles
 
 | Profile | Native interpreter | ROS / overlays | Important pins |
 |---|---|---|---|
 | `agilex-humble-py310-x86_64` | `/usr/bin/python3`, 3.10 | Humble, `sensor_msgs` | NumPy 1.26.4, Pillow 12.3.0 |
-| `tianji-jazzy-py312-aarch64` | `/usr/bin/python3`, 3.12 | Jazzy, `marvin_msgs`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `std_srvs` | NumPy 2.5.3, Pillow 12.3.0, OpenCV 5.0.0.93 |
+| `tianji-jazzy-py312-aarch64` | `/usr/bin/python3`, 3.12 | Jazzy, `marvin_msgs`, `sensor_msgs`, `geometry_msgs`, `std_msgs`, `std_srvs` | NumPy 2.5.3, Pillow 12.3.0, PyAV 18.1.0, OpenCV 5.0.0.93 |
 
 Each directory under `environments/` holds pinned inputs and a hash-locked
 dependency list; both use PyZMQ 27.2.0 and OmegaConf 2.3.1. Pillow matches the
-model environment so robot-side letterboxing equals the server's. Tianji NV12
-decoding requires OpenCV and fails instead of falling back to other colors.
+model environment so robot-side letterboxing equals the server's. PyAV decodes
+the Tianji H.264 mosaic. NV12 decoding (`camera_source: raw`) requires OpenCV
+and fails instead of falling back to other colors.
 
 ## Configuration ownership
 
@@ -141,14 +170,19 @@ uv pip compile --python-version 3.12 --python-platform aarch64-unknown-linux-gnu
 Model terminal, PhyAI environment without ROS:
 
 ```bash
-source .venv/bin/activate
+source .venv/bin/activate   # also puts ninja on PATH for FlashInfer's JIT
 export PHYAI_FLASHINFER_WORKSPACE_BYTES=268435456
-# Only if the bundled Triton assembler rejects the GPU (e.g. Thor, sm_110a):
-export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+export TRITON_PTXAS_BLACKWELL_PATH="$(command -v ptxas)"
 python -m examples.deployment.serve_pi05 \
   --config examples/deployment/configs/pi05_tianji.yaml \
   "policy.checkpoint=$CKPT" 'task=Plug in the Ethernet cable'
 ```
+
+On a GPU whose target is unsupported by Triton's bundled assembler, put a
+compatible CUDA toolkit on PATH and set `TRITON_PTXAS_BLACKWELL_PATH` to its
+`ptxas`. Check that the command above resolves to an executable. This setting
+belongs to the model process. If FlashInfer cannot find `ninja`, activate the
+model environment before launching.
 
 Robot terminal. **This calls controller services and sends commands.**
 

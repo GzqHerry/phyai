@@ -123,3 +123,19 @@ def test_resize_with_pad_matches_pil_letterbox():
     assert same is not result
     with pytest.raises(ValueError):
         resize_with_pad(image.astype(np.float32), 20)
+
+
+def test_resize_stretches_to_the_requested_size():
+    pytest.importorskip("PIL")
+    from phyai_robot.images import resize, resize_with_pad
+
+    image = np.random.default_rng(2).integers(0, 256, (744, 960, 3), dtype=np.uint8)
+    stretched = resize(image, 540, 960)
+    assert stretched.shape == (540, 960, 3) and stretched.flags.writeable
+    padded = resize_with_pad(stretched, 224)
+    content = np.where(padded.max(axis=(1, 2)) > 0)[0]
+    assert padded.shape == (224, 224, 3)
+    assert content.min() >= 49 and content.max() <= 174  # 126 rows, centered.
+    assert resize(stretched, 540, 960) is not stretched
+    with pytest.raises(ValueError):
+        resize(image, 0, 10)

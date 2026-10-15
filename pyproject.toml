@@ -34,7 +34,7 @@ phyai-robot = { workspace = true }
 [dependency-groups]
 deployment = [
     "omegaconf>=2.3,<2.4",
-    "phyai-robot[zmq,images]",
+    "phyai-robot[zmq,images,video]",
 ]
 dev = [
     "pytest>=8",

@@ -83,26 +83,66 @@ def test_codecs_split_both_arms_from_one_message():
     assert encode_gripper(np.array([0.25], np.float32), SimpleNamespace).data == 0.25
 
 
-def test_build_binds_topics_and_separates_camera_workers(ros_messages):
+def test_build_binds_topics_and_decodes_the_mosaic_on_one_worker(ros_messages):
     config = tianji.TianjiConfig(domain_id=24)
     config.wrench_topics = {"left": "/tj/info/wrench_left"}
     embodiment = tianji.build(config, SPEC)
-    backends = embodiment.robot.backends
-    assert [b.observation_keys for b in backends[:3]] == [
-        {"head_camera"},
-        {"left_wrist_camera"},
-        {"right_wrist_camera"},
-    ]
-    command = backends[3]
+    cameras, command = embodiment.robot.backends
+    fields = ("head_camera", "left_wrist_camera", "right_wrist_camera")
+    assert cameras.observation_keys == set(fields) and not cameras.action_keys
+    binding = cameras._observations[fields]
+    assert binding.topic == "/quad_tile/compressed_undistorted"
+    assert binding.message_type is ros_messages["CompressedImage"]
     assert command.action_keys == set(tianji.ACTION_SCHEMA)
     assert {"joint_position_left", "joint_position_right"} <= command.observation_keys
     assert "wrench_left" in command.observation_keys
     assert "eef_left" not in command.observation_keys
     assert command._stop_timeout_s == config.service_timeout_s + 0.5
-    assert all(b._domain_id == 24 for b in backends)
+    assert all(b._domain_id == 24 for b in embodiment.robot.backends)
     assert embodiment.robot.observation_schema["head_camera"].shape == (8, 8, 3)
     feedback = command._observations[("joint_position_left", "joint_position_right")]
     assert feedback.topic == "/tj/info/joint_feedback"
+
+
+def test_mosaic_tiles_are_stretched_like_training_then_letterboxed(ros_messages):
+    config = tianji.TianjiConfig(camera_size=[540, 960])
+    embodiment = tianji.build(config, PolicySpec({}, {}, {"image_size": 224}))
+    cameras = embodiment.robot.backends[0]
+    mosaic = next(iter(cameras._observations.values())).decode
+    frame = np.zeros((1488, 1920, 3), dtype=np.uint8)
+    frame[:744, :960] = 50  # head_left tile
+    frame[744:, :960] = 100  # left wrist tile
+    frame[744:, 960:] = 150  # right wrist tile
+    mosaic.decoder = lambda message: frame
+    tiles = mosaic(object())
+    assert {k: int(v.max()) for k, v in tiles.items()} == {
+        "head_camera": 50,
+        "left_wrist_camera": 100,
+        "right_wrist_camera": 150,
+    }
+    rows = np.where(tiles["head_camera"].max(axis=(1, 2)) > 0)[0]
+    # 960x540 letterboxed into 224x224 keeps 126 centered rows.
+    assert tiles["head_camera"].shape == (224, 224, 3)
+    assert (rows.min(), rows.max()) == (49, 174)
+
+
+def test_raw_source_uses_one_undistorted_topic_per_camera(ros_messages):
+    config = tianji.TianjiConfig(camera_source="raw")
+    embodiment = tianji.build(config, SPEC)
+    cameras = embodiment.robot.backends[:3]
+    assert [b.observation_keys for b in cameras] == [
+        {"head_camera"},
+        {"left_wrist_camera"},
+        {"right_wrist_camera"},
+    ]
+    topics = [next(iter(b._observations.values())).topic for b in cameras]
+    assert all(topic.endswith("_undistorted") for topic in topics)
+
+
+def test_camera_size_null_keeps_the_aspect_ratio():
+    transform = tianji.camera_transform(tianji.TianjiConfig(camera_size=None), 224)
+    rows = np.where(transform(np.full((744, 960, 3), 9, np.uint8)).max(axis=(1, 2)))[0]
+    assert len(rows) == 173  # 224 * 744 / 960
 
 
 def test_controller_enables_in_order_and_idles_only_after_enabling(ros_messages):
@@ -156,6 +196,12 @@ def test_failed_enable_still_requests_idle_on_stop(ros_messages):
         {"model_cameras": {"head_left": "missing"}},
         {"joint_command_topics": {"left": "/a"}},
         {"qos": {"camera": "sensor_data"}},
+        {"camera_source": "webrtc"},
+        {"camera_size": [540]},
+        {"mosaic_tiles": {"head_camera": [2, 0]}},
+        {"mosaic_tiles": {"head_camera": [0, 0], "left_wrist_camera": [0, 0]}},
+        {"mosaic_max_rate_hz": 0},
+        {"camera_source": "raw", "camera_topics": {"head_camera": "/a"}},
     ],
 )
 def test_invalid_configuration_is_rejected(overrides):

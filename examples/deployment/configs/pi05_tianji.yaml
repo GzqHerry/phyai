@@ -1,5 +1,6 @@
 # Tianji pi0.5 checkpoint (metadata-style export: norm_stats.json + *_metadata.json).
 # Cameras, action_dim and delta_mask come from the checkpoint metadata.
+# Configure the compatible CUDA toolkit assembler as described in ROBOT_ENVIRONMENTS.md.
 task: Plug in the Ethernet cable
 policy:
   checkpoint: ???

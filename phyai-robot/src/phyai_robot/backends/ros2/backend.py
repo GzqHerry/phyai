@@ -74,13 +74,16 @@ class RosObservation:
 
     String keys produce one array. Tuple keys produce a mapping with exactly
     those names; all fields from that message share one receive timestamp. QoS
-    is explicit because sensor publishers may use best-effort delivery.
+    is explicit because sensor publishers may use best-effort delivery. A
+    decoder returns None when a message yields no sample, as a stateful video
+    decoder does before it can trust a frame; the previous sample keeps aging.
     """
 
     topic: str  # Full subscription topic, not a field name inferred by the backend.
     message_type: type[Any]  # Actual ROS message class supplied by the application.
-    # A string key decodes to an array; a tuple key decodes to those named fields.
-    decode: Callable[[Any], NDArray[Any] | Mapping[str, NDArray[Any]]]
+    # A string key decodes to an array, a tuple key to those named fields;
+    # None means this message produced no sample.
+    decode: Callable[[Any], NDArray[Any] | Mapping[str, NDArray[Any]] | None]
     qos: QoS = 10  # Must be compatible with the actual publisher.
     recover_on_next_message: bool = False
     # If enabled, read() reports a bad sample until this topic decodes successfully.
@@ -206,6 +209,8 @@ class Ros2Backend(_ThreadedBackend):
                 received_at_ns: int = time.monotonic_ns()
                 try:
                     decoded = spec.decode(message)
+                    if decoded is None:
+                        return
                     if isinstance(key, tuple):
                         if not isinstance(decoded, Mapping) or set(decoded) != set(key):
                             raise ValueError(

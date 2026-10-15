@@ -96,7 +96,7 @@ class TianjiConfig:
     service_timeout_s: float = 3.0
     # Budget for publishing one command.
     io_timeout_s: float = 0.1
-    # Gripper feedback [closed, open] in motor radians; maps model state to [0, 1].
+    # Gripper feedback [lower, upper] in motor radians; maps model state to [0, 1].
     gripper_limits_rad: list[float] = field(default_factory=lambda: [0.0, 1.6])
     # "mosaic": decode the H.264 preview mosaic; "raw": per-camera NV12 images.
     camera_source: str = "mosaic"

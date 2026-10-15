@@ -49,7 +49,10 @@ def encode_arm(values: NDArray[Any], message_type: type[Any]) -> Any:
 
 
 def encode_gripper(values: NDArray[Any], message_type: type[Any]) -> Any:
-    """One normalized target (0 closed, 1 open) as Float32.
+    """One normalized motor-coordinate target as Float32.
+
+    Physical opening direction depends on the installation and calibration;
+    preserve the coordinate convention used by the training data.
 
     The gripper driver maps it to motor travel; the adapter's feedback
     calibration is not applied to commands.

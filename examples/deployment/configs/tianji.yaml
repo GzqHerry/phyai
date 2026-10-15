@@ -7,7 +7,7 @@ robot:
   mode: 3  # 1: joint position; 3: joint impedance.
   velocity_ratio: null  # Controller percentage [1, 100]; null leaves it unchanged.
   service_timeout_s: 3.0  # End-to-end budget per controller service call.
-  gripper_limits_rad: [0.0, 1.6]  # Closed/open feedback position; set to the hardware calibration.
+  gripper_limits_rad: [0.0, 1.6]  # Lower/upper motor coordinate; opening direction depends on hardware.
   # mosaic: H.264 preview of the undistorted cameras.
   # raw: individual undistorted NV12 topics.
   camera_source: mosaic

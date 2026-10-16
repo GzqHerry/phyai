@@ -50,6 +50,7 @@ _BUILTIN_PLUGIN_MODULES: dict[str, str] = {
     "pi05": "phyai.models.pi05.main_pi05",
     "cosmos3": "phyai.models.cosmos3.main_cosmos3",
     "cosmos3_policy": "phyai.models.cosmos3.main_cosmos3_policy",
+    "cosmos3_staged": "phyai.models.cosmos3.main_cosmos3_staged",
     "gr00t_n17": "phyai.models.gr00t_n17.main_gr00t_n17",
     "qwen_image_21": "phyai.models.qwen_image_21.main_qwen_image_21",
     "minicpm_gr00t": "phyai.models.minicpm_gr00t.main_minicpm_gr00t",

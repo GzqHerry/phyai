@@ -103,6 +103,8 @@ class TianjiConfig:
     # Each camera image is resized to this [height, width] before letterboxing,
     # matching training geometry when specified; null keeps its aspect ratio.
     camera_size: list[int] | None = None
+    # Alias for camera_size; accepted for compatibility with converted model configs.
+    camera_resize_hw: list[int] | None = None
     # H.264 mosaic of the undistorted cameras and each field's [row, column].
     mosaic_topic: str = "/quad_tile/compressed_undistorted"
     mosaic_grid: list[int] = field(default_factory=lambda: [2, 2])
@@ -175,10 +177,16 @@ class TianjiConfig:
             raise ValueError("robot.gripper_limits_rad must be finite and increasing")
         if self.camera_source not in CAMERA_SOURCES:
             raise ValueError(f"robot.camera_source must be one of {CAMERA_SOURCES}")
+        if self.camera_size is None and self.camera_resize_hw is not None:
+            self.camera_size = self.camera_resize_hw
         if self.camera_size is not None and (
             len(self.camera_size) != 2 or min(self.camera_size) < 1
         ):
             raise ValueError("robot.camera_size must be [height, width] or null")
+        if self.camera_resize_hw is not None and (
+            len(self.camera_resize_hw) != 2 or min(self.camera_resize_hw) < 1
+        ):
+            raise ValueError("robot.camera_resize_hw must be [height, width] or null")
         if len(self.mosaic_grid) != 2 or min(self.mosaic_grid) < 1:
             raise ValueError("robot.mosaic_grid must be [rows, columns]")
         rows, columns = self.mosaic_grid

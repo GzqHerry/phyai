@@ -7,7 +7,7 @@ deployment loop across robots, and replace the policy without rewriting device
 communication.
 
 The package runs independently of the PhyAI inference engine. Its core depends
-only on NumPy and includes a Mock backend for development without hardware.
+on NumPy (plus an exception-group backport on Python 3.10) and includes a Mock backend for development without hardware.
 ROS2 and ZMQ backends handle device communication; the application supplies the
 message conversions and controller-specific stop behavior.
 
@@ -16,13 +16,14 @@ message conversions and controller-specific stop behavior.
 - [Understand the dual-arm example](#understand-the-dual-arm-example)
 - [Control timing](#control-timing)
 - [Connect your robot](#connect-your-robot)
+- [Separate robot and inference environments](#separate-robot-and-inference-environments)
 
 ## Design and interfaces
 
 Robot communication, model inference, and control timing have separate owners.
 The robot exposes a fixed set of named sensor and command fields. The policy
-accepts its own request type. Deployment connects them through an adapter and
-maintains the action queue.
+accepts its own request type. Deployment connects them through an adapter and a
+scheduler that owns the predicted actions.
 
 ```mermaid
 flowchart TB
@@ -33,7 +34,7 @@ flowchart TB
     subgraph Deployment["RobotDeployment"]
         Loop["Control loop"]
         Adapter["PolicyAdapter"]
-        Queue["Resampling and bounded action queue"]
+        Scheduler["Scheduler (default: StopAndRefill)"]
     end
     Devices <-->|Native messages| Backend
     Backend <-->|Named sensor and command fields| Robot
@@ -41,8 +42,8 @@ flowchart TB
     Loop -->|Snapshot| Adapter
     Adapter -->|Request| Policy
     Policy -->|Result| Adapter
-    Adapter -->|ActionChunk| Queue
-    Queue -->|One Action per tick| Loop
+    Adapter -->|ActionChunk| Scheduler
+    Scheduler -->|One Action per tick| Loop
     Loop -->|send_action| Robot
 ```
 
@@ -58,8 +59,8 @@ The design follows four rules:
    checkpoint joint order, and conversion of predicted deltas to absolute targets
    belong to `PolicyAdapter`. Device codecs handle native device units and messages.
 4. **Keep scheduling in deployment.** The robot sends one command at a time.
-   Deployment decides when to predict, how to resample a chunk, and when to send
-   each command.
+   A `Scheduler` decides when to predict and which command each tick sends;
+   `RobotDeployment` owns the threads, robot I/O and control clock.
 
 ### Who implements what
 
@@ -68,8 +69,9 @@ The design follows four rules:
 | [`Robot`](src/phyai_robot/robot.py) | `observation_schema`, `action_schema`, `connect()`, `get_observation() -> Observation`, `send_action(Action)`, `stop()`, `close()` | Assemble `CompositeRobot` from backends, or implement this interface for an existing robot SDK. |
 | [`Backend`](src/phyai_robot/backends/base.py) | `observation_keys`, `action_keys`, `connect()`, `read() -> Mapping[str, Sample]`, `write(Action)`, `stop()`, `close()` | Configure a supplied backend with codecs, or implement a new transport. |
 | [`Policy[RequestT, ResultT]`](src/phyai_robot/policy.py) | `predict(RequestT) -> ResultT` | Supply a synchronous predictor. `EnginePolicy` delegates to an existing PhyAI engine's `step(request)`. |
-| [`PolicyAdapter[RequestT, ResultT]`](src/phyai_robot/policy.py) | `to_request(Observation) -> RequestT`, `to_actions(ResultT, Observation) -> ActionChunk` | Match this robot's fields to this model's input and output conventions. |
-| [`RobotDeployment`](src/phyai_robot/deployment.py) | `run(max_steps=None)`, `stop()` | Choose control frequency, queue limits, and freshness budgets. |
+| [`PolicyAdapter[RequestT, ResultT]`](src/phyai_robot/policy.py) | `to_request(Observation, InferenceContext) -> RequestT`, `to_actions(ResultT, Observation) -> ActionChunk` | Match this robot's fields to this model's input and output conventions. `VectorAdapter` covers the common "images + state vector -> action rows" case. |
+| [`Scheduler`](src/phyai_robot/scheduling.py) | `wants_inference()`, `begin_inference()`, `add_chunk()`, `is_active()`, `action_at(tick_ns)` | Use `StopAndRefill`, or implement another strategy such as RTC. |
+| [`RobotDeployment`](src/phyai_robot/deployment.py) | `run(max_steps=None)`, `stop()` | Choose the control rate and freshness budgets. |
 
 These interfaces use Python protocols. Your classes only need to implement the
 methods with matching signatures; they do not need to inherit a framework base
@@ -87,7 +89,7 @@ fixed mappings from field names to `FeatureSpec` and are available before connec
 | `Sample` | `value`: a NumPy array in the declared layout; `received_at_ns`: the local `time.monotonic_ns()` value when its message arrived. |
 | `Observation` | `samples`: a mapping from every observation key to its `Sample`. Fields may have different receive times. |
 | `Action` | A mapping from every action key to a NumPy array for **one control tick**. |
-| `ActionChunk` | `actions`: a nonempty tuple of complete `Action` mappings; `step_period_s`: spacing between the model's targets. |
+| `ActionChunk` | `actions`: a nonempty tuple of complete `Action` mappings predicted from one observation. The scheduler decides how fast they are consumed. |
 
 For example, `FeatureSpec((7,), "float32", unit="rad")` describes seven joint
 positions. An RGB camera could use `FeatureSpec((480, 640, 3), "uint8")`; neither
@@ -100,15 +102,19 @@ values in the declared convention; `unit`, `names`, and `frame` document that
 convention. A missing first sensor sample raises `ObservationNotReady` rather
 than substituting zeros.
 
-Snapshots and queued commands contain copied arrays with ordinary writes disabled.
-Copy an array before passing it to code that modifies its input. A frozen
-dataclass alone does not freeze its contained arrays, so a custom `Robot` must
-also detach its returned observations from mutable receive buffers.
+Snapshots and scheduled commands contain read-only arrays. Each array is copied
+once, when a backend caches it or a chunk is accepted; later layers share the
+frozen array instead of copying again. Copy an array before passing it to code
+that modifies its input. A frozen dataclass alone does not freeze its contained
+arrays, so a custom `Robot` must also detach its returned observations from
+mutable receive buffers.
 
 ## Install and run
 
-Use Python 3.12+ and [uv](https://docs.astral.sh/uv/). Run repository commands
-from the **PhyAI repository root**, one directory above this README.
+The standalone package supports Python 3.10+. PhyAI and root-workspace commands
+require Python 3.12+. Run the examples below from the **PhyAI repository root**,
+one directory above this README; keep a robot's interpreter compatible with its
+native ROS/SDK installation.
 
 ### Try the Mock example without a GPU
 
@@ -140,19 +146,12 @@ uv sync --package phyai --extra deployment
 uv run --no-sync python examples/deployment/mock_loop.py --steps 30
 ```
 
-To include the Robot package's ZMQ dependencies, select that package and its
-`zmq` extra too:
-
-```bash
-uv sync --package phyai --package phyai-robot --extra deployment --extra zmq
-```
-
-For all workspace members, including the native extension and optimizer, use
-`uv sync --all-packages --extra zmq`.
+The `deployment` extra includes the Robot package's `zmq` (model RPC) and
+`images` (Pillow) extras. For all workspace members, including the native
+extension and optimizer, use `uv sync --all-packages --extra deployment`.
 
 `--package` selects workspace packages; `--extra` enables named optional
-dependencies on the selected packages. Here, `deployment` belongs to `phyai`,
-and `zmq` belongs to `phyai-robot`. A plain root `uv sync` installs the root
+dependencies on the selected packages. A plain root `uv sync` installs the root
 project's declared dependencies, which do not include `phyai-robot`.
 
 Workspace commands share the root `.venv`. `uv sync` removes packages outside
@@ -165,31 +164,31 @@ against the environment you have already prepared. See uv's
 
 ### Install Robot without the engine
 
-Use a separate environment when developing device communication independently
-of an existing PhyAI environment:
+Create an independent environment with the native interpreter and install the
+local package through `uv pip`. This bypasses the root workspace's Python 3.12
+constraint and does not install the inference engine:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-robot \
-  uv sync --package phyai-robot --no-default-groups
-
-UV_PROJECT_ENVIRONMENT=.venv-robot \
-  uv run --no-sync python examples/deployment/mock_loop.py --steps 30
+/usr/bin/python3 -m venv --without-pip --system-site-packages .venv-robot
+uv pip install --python .venv-robot/bin/python './phyai-robot[zmq,images]'
+.venv-robot/bin/python examples/deployment/mock_loop.py --steps 30
 ```
 
-Add `--extra zmq` to the sync command for ZMQ. `--no-default-groups` omits default
-development tool groups. Package selection limits what is installed, but uv still
-resolves the workspace together. The isolated command above bypasses workspace
-resolution if you only need to try Robot.
+The `zmq` extra supports both inference RPC and the robot I/O ZMQ backend; the
+`images` extra adds Pillow for model-size camera images. Omit them when only the
+core/Mock/ROS backend is needed. `--system-site-packages` lets a
+native robot environment see distribution-provided packages; source the relevant
+ROS and message overlays in its shell. New packages are installed into the venv.
 
-In an application outside this repository, declare the local package as an
-editable dependency instead:
+For the supported AgileX and Tianji deployments, use the matching dependency
+lock, wheel and installer in the [environment guide](../examples/deployment/ROBOT_ENVIRONMENTS.md).
+That guide also covers installing the same lightweight wheel in the model
+process. Deployment examples/configs are distributed alongside the wheel; the
+wheel alone does not contain their entry points.
 
-```bash
-uv add --editable /path/to/phyai/phyai-robot --extra zmq
-```
-
-Replace the path with your checkout and omit `--extra zmq` for the core alone.
-This records the dependency and source in your application's `pyproject.toml`.
+Do not use root `uv sync --package phyai-robot` to install a Python 3.10 robot:
+package selection does not remove the workspace's Python version constraint.
+Always launch `.venv-robot/bin/python` explicitly after installation.
 
 ### Backend dependencies
 
@@ -255,8 +254,7 @@ observations and are still checked for freshness.
 `SmallStepPolicy.predict(request: JointPositions) -> JointPositions` adds
 `0.01` radians to each input joint position and returns absolute arm targets.
 `DualArmAdapter.to_actions(result, observation) -> ActionChunk` adds the two
-gripper targets, both `0.02` meters, and repeats the complete action eight times
-at a spacing of `0.05` seconds.
+gripper targets, both `0.02` meters, and repeats the complete action eight times.
 
 For an initial joint reading of zero, the first chunk therefore holds each joint
 at `0.01` radians and each gripper at `0.02` meters. Later predictions use newer
@@ -269,45 +267,46 @@ this snapshot. The example predicts absolute targets, so it needs no such additi
 
 ### 4. Run the control loop
 
-The example uses 20 Hz model targets and a 20 Hz control loop, with room for
-sixteen source targets. With `--steps 30`, `run(max_steps=30)` connects the robot,
+The example consumes targets with `StopAndRefill(action_hz=20)` and sends
+commands with `DeploymentOptions(control_hz=20)`, so each of the eight targets
+yields one command. With `--steps 30`, `run(max_steps=30)` connects the robot,
 sends thirty commands, then stops and closes both backends.
 
-The producer waits for an empty queue, reads an observation, runs inference,
-and enqueues the retained prefix. The independent control loop interpolates
-source targets at `control_hz`. **It sends nothing while the queue is empty.**
-Observation and inference never run on the control tick, and the next snapshot
-is not read until the previous chunk's last interval and send have finished.
+The worker waits until the scheduler wants a prediction, reads an observation,
+runs inference, and hands the chunk to the scheduler. The independent control
+loop asks the scheduler for one command per tick. **With stop-and-refill it
+sends nothing between chunks.** Observation and inference never run on the
+control tick, and the next snapshot is not read until the previous chunk's last
+interval and send have finished.
 
 ```mermaid
 sequenceDiagram
     participant R as Robot
     participant L as Control thread
-    participant Q as Source action queue
+    participant Q as StopAndRefill scheduler
     participant W as Observation/policy worker
     participant P as Policy
     L->>R: connect()
     loop Until max_steps, stop(), or failure
-        Note over L,W: Empty queue: control waits without sending
+        Note over L,W: Scheduler idle: control waits without sending
         W->>R: get_observation() under I/O lock
         R-->>W: Observation
-        W->>W: adapter.to_request(snapshot)
+        W->>W: adapter.to_request(snapshot, empty context)
         W->>P: predict(request)
         P-->>W: result
         W->>W: adapter.to_actions(result, same snapshot)
-        W->>Q: Validate, detach, enqueue execution_horizon source targets
-        Note over L,W: Worker waits until the queue completely drains
+        W->>Q: Validate, detach, keep the execution_horizon prefix
+        Note over L,W: Worker waits until the chunk has fully run
         loop At control_hz for this chunk
-            L->>Q: Read neighboring source targets, retire consumed targets
-            L->>L: Interpolate continuous fields
+            L->>Q: action_at(tick): interpolate neighboring targets
             L->>R: send_action(action) under I/O lock
         end
-        L->>Q: Release final target after its interval; notify worker
+        L->>Q: Final interval elapsed: scheduler idles; notify worker
     end
     L->>R: stop() and close()
 ```
 
-A condition variable protects the queue and chunk metadata. An I/O lock prevents
+A condition variable protects the scheduler. An I/O lock prevents
 concurrent Robot reads, writes and shutdown; CompositeRobot needs no internal
 synchronization changes. The application owns the policy and engine. Do not use
 them or the robot concurrently while deployment owns their calls. Request
@@ -317,59 +316,69 @@ another run.
 
 ## Control timing
 
-Configure timing with [`DeploymentOptions`](src/phyai_robot/deployment.py):
+Two rates define execution:
 
-| Option | Default | Meaning |
+- `StopAndRefill(action_hz=...)` is the rate at which predicted targets are
+  consumed. With `execution_horizon` it sets how long each chunk runs:
+  `execution_horizon / action_hz` seconds (20 targets at 25 Hz = 0.8 s).
+- `DeploymentOptions(control_hz=...)` is the rate of `send_action` calls while
+  a chunk runs. It only sets the density of linear interpolation between targets:
+  at 25/200 Hz each source interval yields eight commands.
+
+| `DeploymentOptions` | Default | Meaning |
 | --- | --- | --- |
-| `control_hz` | Required | Single-action submission frequency while a chunk executes. |
-| `max_control_lateness_s` | `0.01` | Maximum allowed delay past a scheduled send, independent of `control_hz`; equality is allowed. |
-| `action_hz` | `None` | Source target frequency; `None` uses `ActionChunk.step_period_s`. |
-| `execution_horizon` | `None` | Number of source targets retained per prediction; `None` keeps the whole chunk. |
-| `max_queued_actions` | `50` | Capacity in source targets, not interpolated commands. An oversized retained prefix is rejected. |
-| `max_sample_age_s` | Required | Maximum receive age of every sensor at observation time. |
-| `startup_timeout_s` | `5.0` | Budget for the first complete observation and usable chunk. |
-| `observation_timeout_s` | `5.0` | Per-refill wait for complete, fresh sensor samples; no commands are sent while waiting. |
-| `max_prediction_age_s` | `0.5` | Snapshot-to-send limit, including inference and execution time. |
-| `shutdown_timeout_s` | `2.0` | Wait for in-flight prediction after hardware shutdown. |
-| `interpolate_keys` | Empty | Floating-point fields interpolated linearly; other fields hold the preceding target. |
+| `control_hz` | `200.0` | Command submission rate while the scheduler is active. |
+| `max_sample_age_s` | `0.5` | Maximum receive age of every sensor when a snapshot is taken. |
+| `observation_timeout_s` | `5.0` | Wait for complete, fresh sensors before each prediction; nothing is sent meanwhile. |
+| `shutdown_timeout_s` | `2.0` | Wait for an in-flight prediction after hardware shutdown. |
+| `max_control_lateness_s` | `0.01` | Maximum delay past a scheduled send; equality is allowed. |
 
-There is no low-watermark refill or prefetch. The old `queue_low_watermark`
-option has been removed. Only one prediction runs at a time, and queue exhaustion
-is a normal pause, not a failure. Missing/stale sensors are retried only while
-idle, up to `observation_timeout_s`, without relaxing `max_sample_age_s`. A
-sensor timeout, expired prediction, backend/policy failure, or control lateness
-above `max_control_lateness_s` ends the run and attempts stop/close. The default
-allows up to 10 ms of lateness, including at 200 Hz (a 5 ms period). A late wakeup
-within this budget skips old control ticks and sends the latest due target, not
-an accumulated burst. The chunk clock and source-action timing are unchanged.
-Each new chunk gets a new clock, so waiting for observation/inference is not a
-missed control deadline. Timing errors include the actual lateness, limit,
-wakeup delay, I/O-lock wait, action-preparation time, and previous send duration.
-This is a host-side check before `send_action`, not a ROS delivery-time guarantee;
-it cannot interrupt a send already blocked inside a backend.
+| `StopAndRefill` | Default | Meaning |
+| --- | --- | --- |
+| `action_hz` | Required | Source targets consumed per second. |
+| `execution_horizon` | `None` | Leading targets executed per prediction; `None` keeps all. A shorter prediction is an error. |
+| `interpolate_keys` | `None` | Fields interpolated linearly; `None` selects every floating-point command field. Others hold the preceding target. |
 
-For a source period `dt` and retained horizon `N`, the execution interval is
-`[0, N * dt)`. For time `t`, linearly interpolate between targets
-`i = floor(t / dt)` and `i + 1`, with fraction `(t - i * dt) / dt`. Hold the final
-target over its last source interval; never interpolate toward a discarded tail.
-For `action_hz=25`, `control_hz=200`, and `execution_horizon=20`, twenty queue
-entries normally yield 160 sends over a nominal 0.8-second chunk. Skipped ticks
-reduce this count without stretching the trajectory. `max_steps` counts actual
-sends and may stop partway through a chunk. No commands are emitted during the following
-observation/inference gap.
+### Stop-and-refill
 
-Linear interpolation stays between adjacent endpoints, but does not impose
-velocity/acceleration limits or handle pose rotations. There is no interpolation
-across the inference gap, RTC, or hard real-time guarantee. The first source
-action is sent directly: an application requiring a measured-state ramp must
-provide one separately.
+The worker reads a fresh observation and predicts only when the previous chunk
+has fully finished. The control loop then interpolates the retained prefix on a
+new clock: target `i` is due at `i / action_hz`, and the final target is held
+for one source interval, so the chunk covers `[0, N / action_hz)`. **Nothing is
+sent while the worker observes and predicts.** The robot therefore pauses between
+chunks for observation plus inference time.
 
-Choose freshness budgets that include sensor age, model latency, and execution
-duration. Every required sensor needs a sample before prediction, even if the
-adapter ignores it. Sensors are **not reread during execution**. Receive time is
-not capture time and cannot establish sensor synchronization or detect replayed
-frames. Device-side limits and watchdogs remain necessary, especially because
-no host commands arrive during inference.
+A late wakeup within `max_control_lateness_s` skips old ticks and sends the
+latest due target, never a catch-up burst; larger lateness ends the run. Timing
+errors report the lateness, wakeup delay, I/O-lock wait, preparation time and
+previous send duration. `max_steps` counts actual sends. Interpolation stays
+between adjacent targets; it is not a velocity limiter or pose interpolator, and
+the first target of each chunk is sent without a transition from the previous
+command.
+
+### Custom strategies
+
+`RobotDeployment` calls its scheduler under one lock, from two threads:
+
+| Call | Thread | Purpose |
+| --- | --- | --- |
+| `bind(action_schema)` | Construction | Validate settings against the command fields. |
+| `wants_inference()` | Worker | Take a snapshot and predict now? |
+| `begin_inference(now_ns) -> InferenceContext` | Worker | Record the snapshot time; return the targets that will still run during inference. |
+| `check(chunk)` / `add_chunk(chunk, context, now_ns)` | Worker | Validate, then accept the prediction made for that context. |
+| `is_active()` | Control | Can `action_at` produce commands? |
+| `action_at(tick_ns)` | Control | Command for this tick, or `None` to go idle. |
+
+The adapter receives the `InferenceContext` in `to_request`. Real-time chunking
+fits this protocol: keep `wants_inference()` true while a chunk still executes,
+pass the pending targets to a guided model through the context, and merge the
+new chunk in `add_chunk` so `action_at` never returns `None` between chunks.
+The control loop, I/O lock and shutdown order stay unchanged.
+
+Choose freshness budgets that include sensor age and model latency. Sensors
+are **not reread during execution**. Receive time is not capture time and cannot
+establish sensor synchronization. Device-side limits and watchdogs remain
+necessary, especially because no host commands arrive during inference.
 
 A blocked predictor cannot be forcibly cancelled. If it exceeds the shutdown
 budget, `run()` reports the timeout after stopping hardware and discards the
@@ -396,16 +405,59 @@ Start from the Mock example and replace one boundary at a time:
 | Backend | Configure | Behavior |
 | --- | --- | --- |
 | [`MockBackend`](src/phyai_robot/backends/mock/backend.py) | `initial_values`, `action_to_observation` | Copies commands into mapped feedback; useful for testing schemas, adapters, and control logic. |
-| [`Ros2Backend`](src/phyai_robot/backends/ros2/backend.py) | Per-field `RosObservation(topic, message_type, decode, qos)` and `RosCommand(topic, message_type, encode, qos)`; `on_stop(node)` for command backends | Subscribes to observations and publishes commands using an owned node, context, and executor on one worker thread. |
+| [`Ros2Backend`](src/phyai_robot/backends/ros2/backend.py) | Field/group `RosObservation(topic, message_type, decode, qos)` and `RosCommand(topic, message_type, encode, qos)`; `on_stop(backend)` for command backends | Subscribes, publishes and calls services using an owned node, context, and executor on one worker thread. |
 | [`ZmqBackend`](src/phyai_robot/backends/zmq/backend.py) | PUB/REP peer endpoints, owned keys, `decode_observation`, `encode_action`, `encode_stop`, and `check_reply` | Receives observations through SUB and submits commands through REQ/REP. Application codecs define the multipart byte format and validate acceptance replies. |
 
-A ROS decoder must produce a NumPy array in the field's declared units, joint
-order, and dtype. Its encoder performs the reverse conversion for the controller.
-The `on_stop` callback runs on the backend's worker and must finish within the
-I/O budget without waiting for callbacks on that same worker. This backend covers
-topics; controllers requiring specialized ROS actions or services can implement
-`Backend` directly. ROS2 integration tests are currently
-[TODO](tests/backends/test_ros2.py).
+A string binding key maps one NumPy array to one ROS message. A tuple key maps
+several named fields to one message: its decoder returns a dictionary with
+exactly those keys, and its encoder receives that dictionary. Fields from one
+received message share a timestamp and enter the cache together. Grouped
+commands publish in binding declaration order; existing single-field bindings
+retain the supplied action order. Every encoder completes before any message
+is published. Publishing multiple topics is not atomic.
+
+QoS can be a depth, an rclpy `QoSProfile`, or one of the names `"sensor_data"`,
+`"reliable"` and `"best_effort"`, so robot configs can set it from YAML. It must
+be compatible with the actual peer: a reliable subscription never matches a
+best-effort publisher.
+
+Set `RosCommand(stamp=True)` to fill `header.stamp` from the backend's ROS clock
+immediately before publication. `domain_id=None` uses the native ROS environment;
+an explicit domain applies to that backend's context. A decoder failure normally
+ends the worker. `RosObservation(recover_on_next_message=True)` instead makes
+`read()` report the failure until the next valid message on that binding, without
+changing other bindings' error state.
+
+Decoders preserve the schema's units, joint order and dtype. The pure helpers
+in `backends.ros2.codecs` never import ROS: `decode_rgb_image` (8-bit RGB/BGR/
+RGBA/BGRA/mono with row padding), `decode_nv12_image` (requires OpenCV; there is
+no silent fallback with different colors), `decode_joint_positions` (JointState
+positions in a requested name order), `decode_pose` and `decode_wrench`.
+`phyai_robot.images.resize_with_pad` (the `images` extra) letterboxes RGB to the
+model's square size with the same PIL arithmetic as PhyAI's pi0.5 processor, so
+decoders can cache small images. `image_backends(...)` builds one backend per
+camera so slow image decoding never delays another camera or a command worker.
+Keep robot-specific joint/gripper layouts in the deployment bindings.
+
+Multi-megabyte raw images often lose UDP fragments in DDS. When a camera
+pipeline also publishes H.264 as `sensor_msgs/CompressedImage`, decode that
+stream instead with `backends.ros2.video` (the `video` extra, PyAV).
+`H264Decoder` decodes every access unit in order and uses the slice-header
+`frame_num` to detect a lost reference picture. It returns `None` from that
+loss until the next IDR, because FFmpeg does not flag such damaged frames. A
+decoder that returns `None` caches nothing for that message, so the previous
+sample keeps aging and the deployment's freshness check pauses inference
+instead of using a damaged image. `MosaicDecoder` splits a grid of cameras
+into named tiles from one frame; bind it to a tuple key so the tiles share a
+receive timestamp.
+
+`call_service(type, name, request, timeout_s=...)` runs a ROS service call on the
+backend's worker with one end-to-end deadline and raises on `success == False`.
+The `on_stop` callback receives the backend, runs on its worker and is bounded
+by `stop_timeout_s` (default: `io_timeout_s`), so a stop that calls a controller
+service can take longer than one command publication. [Offline ROS backend tests](tests/backends/test_ros2.py)
+exercise the public contract with in-memory contexts and topics; real middleware
+and QoS interoperability still require hardware integration testing.
 
 For ZMQ, define an explicit stop message and check the reply from your device.
 The backend does not choose a serialization format or automatically replay failed
@@ -440,7 +492,7 @@ watchdogs when the host or communication link is unavailable.
 Run the Mock, deployment, validation, and local ZMQ tests in an isolated environment:
 
 ```bash
-uv run --no-project --isolated --with-editable './phyai-robot[zmq]' --with pytest \
+uv run --no-project --isolated --with-editable './phyai-robot[zmq,images]' --with pytest \
   python -m pytest -c phyai-robot/pyproject.toml --confcutdir=phyai-robot phyai-robot/tests
 ```
 
@@ -449,17 +501,32 @@ independent of the repository's CUDA test bootstrap. They need no GPU or physica
 robot. See the [example](../examples/deployment/mock_loop.py) for the complete application
 and the [source directory](src/phyai_robot) for the typed interfaces and implementations.
 
-## Tianji pi0.5 deployment
+## Separate robot and inference environments
 
-The live entry point is [`examples/deployment/tianji.py`](../examples/deployment/tianji.py).
-Its opening docstring describes environment setup, controller modes, every YAML
-setting, bounded trials, and continuous deployment. The example keeps embodiment
-construction in `robots/tianji.py`, model I/O in `adapters/tianji_pi05.py`, and
-editable defaults in `configs/tianji.yaml`. OmegaConf merges typed YAML with
-dotted command-line overrides; `--print-config` inspects settings without
-connecting to ROS or allocating a model. The loader has no robot/model-specific
-fields: Tianji connection settings live with its factory, pi0.5 mapping settings
-live with its adapter, and the entry point composes their schemas. Running
-without `--print-config` enables control and executes model actions. Check
-controller ownership and physical gripper calibration before launching; these
-are operator responsibilities, not automatically discovered service state.
+The standalone package supports Python >=3.10; the PhyAI workspace requires
+Python >=3.12. A robot can run its native ROS/SDK Python while the model runs in
+a separate environment and process. Install the `zmq` extra for RPC; importing
+`phyai_robot.remote` loads neither ZMQ nor Torch.
+
+The boundary is the model's own contract. `PolicyServer` advertises a
+`PolicySpec`: named input arrays (for example `image.<camera>` and `state`) and
+output arrays (`actions` with shape `(horizon, action_dim)`), plus metadata such
+as the image size. The server performs checkpoint preprocessing, inference and
+postprocessing; it knows nothing about robot fields, units or calibration. The
+robot client's adapter maps its observation to those inputs and the action rows
+to complete commands, so one model server can drive different robots.
+
+`remote.run_remote` is the shared client lifecycle: read the spec, build the
+robot and adapter, check that the adapter's request schema equals the model's
+inputs, reserve a run, connect, run and discard one warmup, check sensor
+freshness again, call the embodiment's `activate()` hook, then run
+`RobotDeployment`. Cleanup always stops and closes the robot before releasing
+the run. `RemotePolicy` reuses one REQ socket and never retries a request.
+
+One run owns the server at a time. A run that sends no request for
+`lease_timeout_s` (default 60 s) is released, so a crashed or disconnected client
+cannot keep the model busy. The protocol has no authentication or encryption;
+bind loopback or use a trusted network.
+
+See [deployment environments](../examples/deployment/ROBOT_ENVIRONMENTS.md) for
+the AgileX and Tianji examples, host profiles and startup commands.

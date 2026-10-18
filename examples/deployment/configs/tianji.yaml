@@ -1,63 +1,151 @@
-# Edit this file, or pass --config with a partial/full YAML override.
-# Paths below are relative to the checkout root, not this YAML's directory.
-# Precedence: typed schema < this file < --config file < dotted CLI overrides.
-# Example overrides: task="Plug in the Ethernet cable" deployment.execution_horizon=20
-# Use --print-config to inspect the merged settings without ROS/GPU allocation.
-# This configuration starts a live deployment; it is not a dry-run configuration.
-task: Plug in the Ethernet cable
-max_steps: null  # Actual Robot.send_action calls; null means continuous until Ctrl-C.
+# ==============================================================================
+# Tianji (Marvin Pro) Robot Deployment Client Configuration
+# ==============================================================================
+# This configuration configures the robot-side control client process for Tianji.
+# It handles native ROS 2 topic subscriptions (joints, grippers, cameras),
+# controller mode and service coordination, command pacing, and ZMQ RPC to the
+# model inference server (configured separately in pi05_tianji.yaml).
+#
+# Inspect merged settings without connecting hardware or RPC:
+#   python -m examples.deployment.tianji --print-config
+#
+# Override settings on the command line:
+#   python -m examples.deployment.tianji schedule.execution_horizon=25 control.control_hz=200.0
+# ==============================================================================
 
-# Device-specific ROS setup, owned by robots/tianji.py. Startup requests ready,
-# this joint mode, optional velocity ratio, then User/Custom input 3. The standard
-# stop/close path requests input 0; it does not restore previous mode/ratio values.
+# ------------------------------------------------------------------------------
+# Execution Duration Limit
+# ------------------------------------------------------------------------------
+# Total number of actual Robot.send_action command calls before graceful shutdown.
+# Set to an integer (e.g. 500) for bounded test runs; set to null to run
+# continuously until interrupted with Ctrl-C.
+max_steps: null
+
+# ------------------------------------------------------------------------------
+# Robot Hardware & Native ROS 2 Parameters
+# ------------------------------------------------------------------------------
 robot:
-  mode: 3  # 1: joint position; 3: joint impedance. Mode 2 does not accept joint targets.
-  velocity_ratio: null  # Optional controller percentage [0, 100]; null leaves it unchanged.
-  node_name: phyai_tianji_robot
-  service_timeout_s: 3.0  # Per-service availability and response timeout.
-  io_timeout_s: 0.1  # CompositeRobot backend read/write/stop timeout.
+  # ROS 2 DDS domain ID for robot hardware communication.
+  # Must match the ROS_DOMAIN_ID used by the Marvin Pro Apex controller stack (default: 24).
+  # Set to null to inherit ROS_DOMAIN_ID from the calling shell environment.
+  domain_id: 24
 
-# Model/robot mapping, owned by adapters/tianji_pi05.py. State layout is
-# [left joints x7, left gripper, right joints x7, right gripper]; joint units are
-# radians and model gripper values are normalized. Only gripper feedback position
-# enters the model. EEF, wrench, and the rest of the raw feedback stay in Observation.
-# Relative metadata_file paths are the exception to the root-path rule above:
-# they resolve inside the checkpoint directory, not inside this YAML's directory.
-adapter:
-  metadata_file: null  # Relative to checkpoint; null discovers deployment metadata.
-  gripper_limits_rad: [0.0, 1.6]  # Closed/open motor positions; set to actual hardware calibration.
+  # Base name for ROS 2 nodes created by this client process.
+  node_name: phyai_tianji
 
-# Engine settings, owned by policies.py. Construction loads the local model;
-# one complete warmup prediction is decoded and discarded before enabling input.
-# Changing execution_horizon below does not shorten the model's 50-step prediction.
-policy:
-  checkpoint: ???  # Required: local converted pi0.5 weights, tokenizer, stats and metadata.
-  kernel_policy: examples/deployment/configs/pi05_bf16.yaml
-  seed: 42  # CPU diffusion-noise stream; a fresh sample is drawn for each prediction.
-  # Positive Euler-step count; null preserves config.json. Applied before CUDA
-  # graph capture, so changing this requires restarting the deployment. This
-  # affects predicted trajectories, not horizon length or action/control rates.
-  num_inference_steps: null
-  use_cuda_graph: true
-  num_threads: 16  # PhyAI runtime CPU thread count, not ROS callback threads.
+  # Target controller operating mode:
+  #   1: Joint Position Mode (direct joint angle tracking)
+  #   3: Joint Impedance Mode (compliant joint torque/stiffness control, default)
+  # Note: Mode 2 is Cartesian Impedance Mode; it does not accept joint targets and is rejected.
+  mode: 3
 
-# Shared RobotDeployment settings, owned by options.py and phyai-robot.
-# With defaults, retain 20 of 50 model-rate targets. Adjacent targets are 40 ms
-# apart; the loop interpolates absolute arm/gripper positions every 5 ms. It holds
-# the final target for one source interval: 0.8 s and nominally 160 complete sends.
-# All four action fields are sent at control_hz; there is no separate gripper loop.
-# Queue capacity is in source targets, not expanded 200 Hz commands. Once empty,
-# the queue triggers a fresh observation/prediction and no commands are sent until
-# the new prefix is ready. This is not prediction/execution overlap across chunks.
-# Ensure max_prediction_age_s covers inference plus the intended execution window.
-deployment:
-  action_hz: 25.0  # Source-model targets: 40 ms between adjacent actions.
-  control_hz: 200.0  # Interpolated complete robot commands: nominal 5 ms intervals.
-  execution_horizon: 20  # Execute this prefix of the model's 50 predicted targets.
-  max_queued_actions: 20  # Source-target capacity; must cover execution_horizon.
-  max_sample_age_s: 0.5  # Oldest allowed locally received sample at snapshot time.
-  startup_timeout_s: 10.0  # Wait for first executable prediction after enabling control.
-  observation_timeout_s: 10.0  # Wait for a complete/fresh snapshot before each prediction.
-  max_prediction_age_s: 2.0  # Snapshot-to-send age, including inference and execution.
-  shutdown_timeout_s: 2.0  # Wait for in-flight inference after robot stop/close.
-  max_control_lateness_s: 0.01  # Allow at most 10 ms past a scheduled control tick.
+  # Controller velocity ratio percentage in integer range [1, 100].
+  # Sets the controller motion scaling factor via the /tj/control/set_vel_ratio service.
+  # Set to null to leave the controller's existing device-side ratio unchanged.
+  velocity_ratio: null
+
+  # Maximum timeout (in seconds) for each synchronous ROS 2 controller service call
+  # (e.g., set_ready, set_mode, set_input, set_vel_ratio).
+  # Covers service server discovery and reply turnaround.
+  service_timeout_s: 3.0
+
+  # Maximum I/O timeout (in seconds) for publishing single-tick joint/gripper command topics.
+  io_timeout_s: 0.1
+
+  # Gripper motor stroke calibration limits in radians [lower, upper].
+  # Maps the raw motor position feedback into normalized range [0.0, 1.0] for the model state vector.
+  # 0.0 corresponds to closed, 1.6 corresponds to fully open travel.
+  gripper_limits_rad: [0.0, 1.6]
+
+  # Camera ingestion source:
+  #   "mosaic": Subscribes to the unified H.264 compressed mosaic stream (/quad_tile/compressed_undistorted).
+  #             Delivers ~30 fps at ~1 MB/s using single-thread zero-latency slice decoding.
+  #   "raw":    Subscribes to individual uncompressed NV12 topics (/camera/<name>/image_nv12_undistorted).
+  #             Warning: Each 7.6 MB frame causes severe Fast DDS UDP socket buffer drop on Thor (~0.5 fps).
+  camera_source: mosaic
+
+  # Camera tile stretch resolution [height, width] before square letterboxing.
+  # When set to [540, 960], it precisely replicates the aspect ratio stretching used during
+  # dataset collection on Marvin Pro (stretching 960x744 raw mosaic tiles to 960x540).
+  # Set to null to preserve the camera stream's decoded aspect ratio.
+  camera_size: [540, 960]
+
+  # Alias for camera_size for compatibility with converted model metadata configs.
+  camera_resize_hw: null
+
+  # Maximum frame conversion rate (in Hz) for the H.264 mosaic decoder.
+  # Decodes every H.264 slice to preserve stream reference frames, but throttles RGB conversion.
+  mosaic_max_rate_hz: 15.0
+
+  # ROS 2 topic name for the unified 4-camera compressed H.264 mosaic stream.
+  mosaic_topic: /quad_tile/compressed_undistorted
+
+  # Grid dimensions [rows, columns] of the multi-camera mosaic image.
+  mosaic_grid: [2, 2]
+
+  # Grid cell coordinates [row, column] for each logical camera in the mosaic:
+  #   head_camera:        Top-left cell (0, 0) -> Left eye camera
+  #   left_wrist_camera:  Bottom-left cell (1, 0) -> Left wrist camera
+  #   right_wrist_camera: Bottom-right cell (1, 1) -> Right wrist camera
+  mosaic_tiles:
+    head_camera: [0, 0]
+    left_wrist_camera: [1, 0]
+    right_wrist_camera: [1, 1]
+
+# ------------------------------------------------------------------------------
+# Remote Model Policy RPC Connection
+# ------------------------------------------------------------------------------
+remote:
+  # ZMQ RPC endpoint of the resident PhyAI policy server (serve_pi05.py).
+  # For local single-machine deployment, use loopback: tcp://127.0.0.1:5555.
+  # For distributed multi-machine deployment, specify the server's network IP: tcp://<ip>:<port>.
+  endpoint: tcp://127.0.0.1:5555
+
+  # Timeout (in seconds) for standard synchronous RPC calls (info, begin, predict, end).
+  timeout_s: 2.0
+
+  # Timeout (in seconds) for the initial warmup prediction call.
+  # Kept large (120s) to allow first-run CUDA graph capture, kernel compilation, and JIT tracing.
+  warmup_timeout_s: 120.0
+
+# ------------------------------------------------------------------------------
+# Control Loop Timing & Freshness Budgets
+# ------------------------------------------------------------------------------
+control:
+  # Actuator command publishing frequency (in Hz) during trajectory chunk execution.
+  # The control loop interpolates between model-rate targets at this frequency (200 Hz = 5 ms tick).
+  control_hz: 200.0
+
+  # Maximum allowable age (in seconds) for any sensor sample at observation snapshot time.
+  # If any sensor sample is older than this limit, the observation is considered stale and retried.
+  max_sample_age_s: 0.5
+
+  # Maximum duration (in seconds) to wait for all sensors to become available and fresh
+  # before triggering an inference request. Prevents deadlock if a camera publisher dies.
+  observation_timeout_s: 10.0
+
+  # Grace period (in seconds) to wait for an in-flight background prediction to terminate
+  # after hardware stop/close has been initiated.
+  shutdown_timeout_s: 2.0
+
+  # Maximum tolerated execution delay (in seconds) past a scheduled control tick deadline.
+  # If loop execution or I/O lock contention exceeds this limit (e.g. 10 ms), the deployment
+  # halts safely instead of emitting a burst of delayed catch-up commands.
+  max_control_lateness_s: 0.01
+
+# ------------------------------------------------------------------------------
+# Action Chunk Scheduling Strategy
+# ------------------------------------------------------------------------------
+schedule:
+  # Trajectory execution scheduling strategy:
+  #   "stop_and_refill": Executes an action chunk prefix, pauses actuation, acquires a fresh
+  #                      observation snapshot, queries inference, and resumes execution.
+  strategy: stop_and_refill
+
+  # Rate (in Hz) at which predicted source action targets are consumed from the chunk.
+  # For Tianji models trained with action_stride=2 at 50 Hz dataset rate, nominal target rate is 25 Hz (40 ms).
+  action_hz: 25.0
+
+  # Number of leading actions from each predicted chunk to execute before triggering a refill.
+  # With action_hz=25.0 and execution_horizon=20, each chunk executes for exactly 20 / 25 = 0.8 seconds.
+  execution_horizon: 20

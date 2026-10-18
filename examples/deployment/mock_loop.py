@@ -17,8 +17,10 @@ from phyai_robot import (
     FeatureSpec,
     Observation,
     PolicyAdapter,
+    StopAndRefill,
     CompositeRobot,
     RobotDeployment,
+    InferenceContext,
     DeploymentOptions,
 )
 from numpy.typing import NDArray
@@ -27,7 +29,7 @@ from phyai_robot.backends.mock import MockBackend
 # Both mappings have "left.target_q" and "right.target_q" keys. Each value is
 # a float32 array of shape (7,), in radians and in the robot schema joint order.
 # A request contains current positions; a prediction contains absolute targets.
-type JointPositions = Mapping[str, NDArray[np.float32]]
+JointPositions = Mapping[str, NDArray[np.float32]]
 
 
 class SmallStepPolicy:
@@ -43,11 +45,14 @@ class SmallStepPolicy:
 class DualArmAdapter:
     """Select independent observations and map them to absolute target fields."""
 
-    def to_request(self, observation: Observation) -> JointPositions:
+    def to_request(
+        self, observation: Observation, context: InferenceContext
+    ) -> JointPositions:
         """Extract joint arrays from the robot's named, timestamped samples.
 
         observation.samples also contains gripper widths and an RGB camera.
         Each Sample stores its array in value and its receive time separately.
+        context is always empty with the stop-and-refill scheduler.
         """
         # The camera remains a valid observation although this toy policy uses
         # only joint positions. There is no requirement to consume every sensor.
@@ -59,7 +64,7 @@ class DualArmAdapter:
     def to_actions(
         self, result: JointPositions, observation: Observation
     ) -> ActionChunk:
-        """Complete each command with gripper targets, then hold it for 8 ticks.
+        """Complete each command with gripper targets and repeat it 8 times.
 
         result contains absolute arm targets. This adapter does not need the
         paired observation again; a relative-action adapter would use it to
@@ -70,7 +75,7 @@ class DualArmAdapter:
             "left.target_width": np.array([0.02], dtype=np.float32),
             "right.target_width": np.array([0.02], dtype=np.float32),
         }
-        return ActionChunk(actions=tuple(action for _ in range(8)), step_period_s=0.05)
+        return ActionChunk(tuple(action for _ in range(8)))
 
 
 def main() -> None:
@@ -129,17 +134,13 @@ def main() -> None:
         robot=robot,
         policy=policy,
         adapter=adapter,
-        options=DeploymentOptions(
-            control_hz=20,
-            max_sample_age_s=0.5,
-            max_prediction_age_s=2,
-            action_hz=20,  # Model targets have a configurable 50ms spacing.
-            max_queued_actions=16,
-        ),
+        # Consume 20 targets per second; each executed chunk lasts 8 / 20 s.
+        scheduler=StopAndRefill(action_hz=20),
+        options=DeploymentOptions(control_hz=20, max_sample_age_s=0.5),
     )
     # run connects the robot and owns both stop and close on completion/failure.
     # Here action_hz equals control_hz, so each of the eight targets yields one
-    # send before the next observation/inference cycle refills the empty queue.
+    # send before the next observation/inference cycle starts.
     deployment.run(max_steps=args.steps)
     print(f"Completed {arm_backend.write_count} steps; both backends stopped.")
 

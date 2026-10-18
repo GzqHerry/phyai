@@ -15,7 +15,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 
 from phyai import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
@@ -38,6 +37,7 @@ def load_processor(checkpoint: Path) -> tuple[PI05Processor, dict]:
         dataset_stats={"observation.state": stats["state"], "action": stats["actions"]},
         action_dim=metadata["action_dim"],
         normalize_pixels=True,
+        image_resize_backend="pil",
         params_dtype=torch.float32,
     )
     # OpenPI uses NumPy float64 stats and epsilon 1e-6.
@@ -52,23 +52,13 @@ def load_processor(checkpoint: Path) -> tuple[PI05Processor, dict]:
 
 
 def prepare_observation(processor: PI05Processor, metadata: dict, payload):
+    # The processor letterboxes RGB uint8 with PIL bilinear, as in training.
     images = []
     for camera in metadata["camera_names"]:
         image = np.asarray(payload[camera])
         if image.dtype != np.uint8 or image.ndim != 3 or image.shape[-1] != 3:
             raise ValueError(f"{camera} must be an RGB uint8 HWC image")
-        height, width = image.shape[:2]
-        size = processor.image_size
-        ratio = max(width / size, height / size)
-        resized_size = (int(width / ratio), int(height / ratio))
-        resized = Image.fromarray(image).resize(resized_size, Image.Resampling.BILINEAR)
-        padded = Image.new("RGB", (size, size))
-        padded.paste(
-            resized, ((size - resized.width) // 2, (size - resized.height) // 2)
-        )
-        images.append(
-            torch.from_numpy(np.array(padded)).permute(2, 0, 1)[None].float() / 255.0
-        )
+        images.append(torch.from_numpy(image.copy()).permute(2, 0, 1)[None])
     state = np.asarray(payload["state"], dtype=np.float32)
     if state.shape != (metadata["action_dim"],):
         raise ValueError(

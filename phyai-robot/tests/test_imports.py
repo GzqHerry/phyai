@@ -14,7 +14,11 @@ import phyai_robot
 from phyai_robot.backends.mock import MockBackend
 from phyai_robot.backends.ros2 import Ros2Backend
 from phyai_robot.backends.zmq import ZmqBackend
-assert not {'torch', 'phyai', 'rclpy', 'zmq', 'can'} & set(sys.modules)
+from phyai_robot.backends.ros2.codecs import decode_nv12_image
+from phyai_robot.images import resize_with_pad
+from phyai_robot.remote import RemotePolicy, PolicyServer, run_remote
+loaded = {'torch', 'phyai', 'rclpy', 'zmq', 'can', 'PIL', 'cv2'} & set(sys.modules)
+assert not loaded, loaded
 """
     subprocess.run(
         [sys.executable, "-c", script],

@@ -6,10 +6,12 @@ from collections.abc import Mapping
 
 import numpy as np
 import pytest
-from phyai_robot import Sample, FeatureSpec, Observation
+from phyai_robot import Sample, FeatureSpec, Observation, ObservationNotReady
 from numpy.typing import NDArray
 from phyai_robot.validation import (
+    freeze,
     freeze_samples,
+    check_freshness,
     validate_schema,
     validate_values,
     validate_observation,
@@ -76,3 +78,32 @@ def test_snapshot_does_not_silently_convert_lists_to_arrays() -> None:
         freeze_samples(
             {"q": Sample([1.0, 2.0], time.monotonic_ns())}  # type: ignore[arg-type]  # Deliberately pass a list.
         )
+
+
+def test_freeze_copies_only_arrays_that_can_still_change() -> None:
+    owned = np.arange(4.0)
+    frozen = freeze(owned)
+    assert frozen is not owned and not frozen.flags.writeable
+    assert freeze(frozen) is frozen
+    view = frozen[1:]
+    assert freeze(view) is view  # A read-only view of frozen memory stays shared.
+    writable_base = np.arange(4.0)
+    readonly_view = writable_base[:]
+    readonly_view.flags.writeable = False
+    assert freeze(readonly_view) is not readonly_view  # Its base can still change.
+    immutable = np.frombuffer(b"\x01\x02", dtype=np.uint8)
+    assert freeze(immutable) is immutable
+
+
+def test_check_freshness_reports_every_stale_field() -> None:
+    now = time.monotonic_ns()
+    observation = Observation(
+        {
+            "fresh": Sample(np.zeros(1), now),
+            "old": Sample(np.zeros(1), now - 2 * 10**9),
+            "future": Sample(np.zeros(1), now + 10**9),
+        }
+    )
+    with pytest.raises(ObservationNotReady, match="'old', 'future'"):
+        check_freshness(observation, 1.0, now)
+    check_freshness(Observation({"fresh": observation.samples["fresh"]}), 1.0, now)

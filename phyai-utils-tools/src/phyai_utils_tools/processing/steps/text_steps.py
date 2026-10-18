@@ -75,6 +75,8 @@ class TokenizerStep(ProcessorStep):
                 raise ValueError(
                     "Token suffixes require right padding to a positive max_length"
                 )
+            if self.tokenizer.pad_token_id is None:
+                raise ValueError("Token suffixes require a tokenizer pad_token_id")
             # Encode the suffix separately; concatenating strings can change BPE merges.
             suffix_ids = self.tokenizer.encode(self.suffix, add_special_tokens=False)
             encoded = self.tokenizer(

@@ -89,9 +89,7 @@ def main(argv=None) -> None:
     policy = Pi05Policy(config.policy, processing)
 
     try:
-        spec = policy.spec(
-            {**processing.metadata, "task": processing.task, "seed": config.policy.seed}
-        )
+        spec = policy.spec({"task": processing.task, "seed": config.policy.seed})
         server = PolicyServer(
             policy=policy,
             spec=spec,

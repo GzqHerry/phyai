@@ -29,7 +29,7 @@ lease_timeout_s: 60.0
 # ------------------------------------------------------------------------------
 policy:
   # Path to the exported Pi0.5 model checkpoint directory.
-  # Must contain config.json, safetensors weights, norm_stats.json, and tokenizer files.
+  # Must contain config.json, weights, tokenizer files, and the two processing pipelines.
   # Required parameter; marked as MISSING (???) in base template.
   checkpoint: ???
 
@@ -55,29 +55,10 @@ policy:
 # Observation Preprocessor Configuration
 # ------------------------------------------------------------------------------
 processor:
-  # Optional custom processor factory specification:
-  #   null: Uses default Pi05Processing wrapper.
-  #   "module:ClassName": Loads ClassName from installed Python module.
-  #   "path/file.py:ClassName": Loads ClassName from a standalone source file.
+  # null uses native checkpoint pipelines; external factories remain optional.
   factory: null
-
-  # Extra keyword arguments passed exclusively to an external custom processor factory.
   options: {}
-
-  # Ordered list of camera names matching the model's visual input conventions.
-  # Required for LeRobot-style checkpoints (where config does not specify camera order);
-  # for metadata-style checkpoints (RLinf), verified against deployment_metadata.json.
   camera_names: null
-
-  # Dimensionality of the unpadded physical action vector.
-  # Required for LeRobot-style checkpoints; verified against metadata for RLinf checkpoints.
   action_dim: null
-
-  # Relative filename of the deployment metadata JSON within the checkpoint directory.
-  # If null, automatically discovers deployment_metadata.json or the unique *_metadata.json.
-  metadata_file: null
-
-  # Image resizing backend:
-  #   "pil":   Uses Pillow bilinear interpolation (matches training dataset preprocessing).
-  #   "torch": Uses PyTorch interpolate operator.
+  action_dtype: float32
   image_resize_backend: pil

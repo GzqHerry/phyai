@@ -40,14 +40,10 @@ policy:
   num_threads: 16
 
 processor:
-  # Camera view order expected by the AgileX checkpoint vision encoder.
+  # null uses native checkpoint pipelines; external factories remain optional.
+  factory: null
+  options: {}
   camera_names: [front, left, right]
-
-  # Physical action dimensionality (6 arm joints + 1 gripper position per arm = 14).
   action_dim: 14
-
-  # Metadata file name (if present).
-  metadata_file: null
-
-  # Image resizing backend matching LeRobot PIL bilinear preprocessing.
+  action_dtype: float32
   image_resize_backend: pil

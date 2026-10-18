@@ -1,9 +1,9 @@
 # ==============================================================================
 # Model Server Configuration for Tianji (Marvin Pro) Pi0.5 Checkpoints
 # ==============================================================================
-# Configures serve_pi05.py for Tianji metadata-style checkpoints (RLinf / OpenPI JAX).
-# Camera order, action dimension (16), and delta masks are automatically discovered
-# and validated from the checkpoint's deployment_metadata.json or rlinf_metadata.json.
+# Configures serve_pi05.py for Tianji native pipeline exports.
+# Camera order and action dimension are declared below. Checkpoint pipelines own
+# normalization and delta decoding.
 #
 # Environment requirement on NVIDIA Thor (sm_110a architecture):
 #   export TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
@@ -43,8 +43,10 @@ policy:
   num_threads: 16
 
 processor:
-  # For Tianji, camera_names and action_dim are loaded from checkpoint metadata.
-  camera_names: null
-  action_dim: null
-  metadata_file: null
+  # null uses native checkpoint pipelines; external factories remain optional.
+  factory: null
+  options: {}
+  camera_names: [head_left, left_wrist, right_wrist]
+  action_dim: 16
+  action_dtype: float64
   image_resize_backend: pil

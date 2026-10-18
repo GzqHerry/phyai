@@ -1,11 +1,9 @@
-"""Entry-point configuration parsing and server-side checkpoint metadata."""
-
-import json
+"""Entry-point configuration parsing and processor interface settings."""
 
 import pytest
 
 from examples.deployment import agilex, tianji
-from examples.deployment.pi05 import Pi05ProcessorConfig, _read_metadata
+from examples.deployment.pi05 import Pi05ProcessorConfig
 from examples.deployment.client import validate_client
 from examples.deployment.serve_pi05 import DEFAULT_CONFIG, Pi05ServerConfig
 from examples.deployment.configuration import parse_config
@@ -70,45 +68,6 @@ def test_server_config_requires_an_existing_checkpoint(tmp_path):
     assert config.processor.image_resize_backend == "pil"
 
 
-def metadata(**overrides):
-    values = dict(
-        action_dim=2,
-        action_horizon=50,
-        camera_names=["a", "b"],
-        delta_mask=[True, False],
-        norm_eps=1e-6,
-    )
-    values.update(overrides)
-    return values
-
-
-def test_metadata_discovery_is_generic_and_strict(tmp_path):
-    (tmp_path / "x_metadata.json").write_text(json.dumps(metadata()))
-    assert _read_metadata(tmp_path, None)["camera_names"] == ["a", "b"]
-    (tmp_path / "y_metadata.json").write_text(json.dumps(metadata()))
-    with pytest.raises(ValueError, match="metadata_file"):
-        _read_metadata(tmp_path, None)
-    assert _read_metadata(tmp_path, "y_metadata.json")["action_dim"] == 2
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"delta_mask": [True]},
-        {"camera_names": ["a", "a"]},
-        {"action_dim": 0},
-        {"norm_eps": 0},
-        {"delta_mask": [1, 0]},
-    ],
-)
-def test_inconsistent_metadata_is_rejected(tmp_path, overrides):
-    (tmp_path / "deployment_metadata.json").write_text(
-        json.dumps(metadata(**overrides))
-    )
-    with pytest.raises(ValueError):
-        _read_metadata(tmp_path, None)
-
-
 def test_processor_config_validation():
     Pi05ProcessorConfig(camera_names=["a"], action_dim=3).validate()
     for bad in (
@@ -116,6 +75,7 @@ def test_processor_config_validation():
         Pi05ProcessorConfig(camera_names=["a", "a"]),
         Pi05ProcessorConfig(action_dim=0),
         Pi05ProcessorConfig(image_resize_backend="cv2"),
+        Pi05ProcessorConfig(action_dtype="int64"),
     ):
         with pytest.raises(ValueError):
             bad.validate()

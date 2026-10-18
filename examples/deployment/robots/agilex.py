@@ -1,8 +1,21 @@
-"""AgileX dual Piper robot: ROS bindings and model adapter.
+"""AgileX dual Piper robot: ROS bindings, camera decoders, and model adapter.
 
-One complete write publishes both arms. Stopping only ends publication: no
-services, homing or motor-enable calls are made. RobotDeployment is the only
-action scheduler.
+Architecture & Invariants:
+    1. Sensor Ingestion:
+       - Cameras: Three independent Orbbec RGB cameras (/camera_f|l|r/color/image_raw).
+         Allocates one dedicated worker thread per camera (`image_backends`) to decode and
+         letterbox frames to the model's required image size (224x224).
+       - Joint & Gripper Feedback: Piper drivers publish `sensor_msgs.msg.JointState` for each
+         arm (/puppet/joint_left|right) containing 7 values: 6 revolute arm joint angles (rad)
+         followed by 1 gripper position (meters). A grouped tuple binding decodes both fields
+         together, ensuring strictly synchronized arrival timestamps.
+    2. Model Mapping (VectorAdapter):
+       - Assembles the 14-DoF state vector: [L_j0..L_j5, L_grip, R_j0..R_j5, R_grip].
+       - Arm angles in radians, gripper positions in meters.
+    3. Hardware Commands:
+       - Actuator commands publish to /joint_left_states and /joint_right_states at control_hz (200 Hz).
+       - Each arm command is a stamped JointState containing 6 arm angles and 1 gripper position.
+       - No motor-enable, homing, or service calls are performed; stopping simply ends topic publication.
 """
 
 from __future__ import annotations
@@ -34,13 +47,23 @@ SIDES = ("left", "right")
 
 @dataclass
 class AgilexConfig:
-    """AgileX ROS topics and node settings; no checkpoint or model settings."""
+    """AgileX dual Piper robot ROS 2 connection and topic configuration.
 
-    # null uses ROS_DOMAIN_ID from the environment.
+    Attributes:
+        domain_id: ROS 2 domain ID matching Piper and Orbbec driver launch (default: 0).
+            Set to null to inherit ROS_DOMAIN_ID from the calling shell.
+        node_name: Base name for ROS 2 nodes instantiated by this client.
+        io_timeout_s: Maximum budget for publishing single-tick commands.
+        camera_topics: Mapping from camera field names to native ROS 2 RGB image topics.
+        model_cameras: Mapping from model camera keys to robot observation fields.
+        state_topics: Per-side JointState feedback topics published by Piper drivers.
+        command_topics: Per-side JointState command topics accepted by Piper drivers.
+        qos: Mapping of topic categories to QoS profile aliases.
+    """
+
     domain_id: int | None = None
     node_name: str = "phyai_agilex"
     io_timeout_s: float = 0.1
-    # Observation field -> RGB image topic.
     camera_topics: dict[str, str] = field(
         default_factory=lambda: {
             "front_camera": "/camera_f/color/image_raw",
@@ -48,7 +71,6 @@ class AgilexConfig:
             "right_camera": "/camera_r/color/image_raw",
         }
     )
-    # Model camera name -> observation field.
     model_cameras: dict[str, str] = field(
         default_factory=lambda: {
             "front": "front_camera",
@@ -77,6 +99,7 @@ class AgilexConfig:
     )
 
     def validate(self) -> None:
+        """Reject malformed or conflicting topic and domain configurations."""
         if self.domain_id is not None and not 0 <= self.domain_id <= 232:
             raise ValueError("robot.domain_id must be in [0, 232] or null")
         if not self.node_name.replace("_", "").isalnum():
@@ -104,7 +127,7 @@ ACTION_SCHEMA = {
 
 
 def observation_schema(config: AgilexConfig, image_size: int) -> dict[str, FeatureSpec]:
-    """Model-size RGB cameras plus the same joint/gripper fields as commands."""
+    """Construct ObservationSchema based on active camera and Piper feedback topics."""
     return {
         **{
             key: FeatureSpec((image_size, image_size, 3), "uint8")
@@ -115,7 +138,7 @@ def observation_schema(config: AgilexConfig, image_size: int) -> dict[str, Featu
 
 
 def make_adapter(config: AgilexConfig, observations: dict[str, FeatureSpec]):
-    """Dataset layout: [left 6 joints, left gripper, right 6 joints, right gripper]."""
+    """Construct a VectorAdapter binding AgileX 14-DoF joints and gripper travel."""
     fields = [
         key for side in SIDES for key in (f"joint_position_{side}", f"gripper_{side}")
     ]
@@ -129,13 +152,13 @@ def make_adapter(config: AgilexConfig, observations: dict[str, FeatureSpec]):
 
 
 def build(config: AgilexConfig, spec: PolicySpec) -> Embodiment:
-    """Compose camera and joint backends plus the adapter, without ROS I/O."""
+    """Construct AgileX CompositeRobot, VectorAdapter, and embodiment container."""
     from sensor_msgs.msg import Image, JointState
 
     image_size = int(spec.metadata["image_size"])
     ros = dict(domain_id=config.domain_id, io_timeout_s=config.io_timeout_s)
-    # One JointState per arm carries two schema fields. A tuple binding keeps
-    # their receive timestamps together and publishes one message per arm.
+
+    # Grouped tuple bindings for Piper arms: joint angles and gripper travel share one JointState packet.
     states, commands = {}, {}
     for side in SIDES:
         fields = (f"joint_position_{side}", f"gripper_{side}")
@@ -153,10 +176,11 @@ def build(config: AgilexConfig, spec: PolicySpec) -> Embodiment:
             config.qos["command"],
             stamp=True,
         )
+
     joints = Ros2Backend(
         observations=states,
         actions=commands,
-        # Stopping only ends publication; do not home, hold or disable motors.
+        # Stopping ends command publication without homing arms or disabling motors.
         on_stop=lambda backend: None,
         node_name=config.node_name,
         **ros,

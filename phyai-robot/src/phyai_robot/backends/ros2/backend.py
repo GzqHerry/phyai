@@ -1,7 +1,20 @@
-"""ROS2 topic observations, topic commands and service calls on one worker.
+"""ROS 2 topic subscriptions, command publishing, and service coordination.
 
-ROS2, message packages, and a Python-compatible rclpy installation are supplied
-by the host. Topic commands describe submission, not motion completion.
+Architecture:
+    Each `Ros2Backend` manages its own private `rclpy.context.Context`, `rclpy.node.Node`,
+    and `rclpy.executors.SingleThreadedExecutor` confined strictly to its worker thread:
+    - Isolation: Private contexts guarantee that shutting down one backend does not call
+      the global `rclpy.shutdown()`, which would destroy sibling backends or host nodes.
+    - Synchronized Subscriptions: Sensor topics are converted via user-provided decoders
+      in the worker thread and cached as immutable Samples with local arrival timestamps.
+    - Grouped Topic Bindings: Multiple fields can be decoded from a single multi-signal topic
+      (e.g., both left and right arm joint feedback from one JointState message), guaranteeing
+      strictly identical arrival timestamps without redundant network subscriptions.
+    - Synchronous Service Coordination: `call_service()` enables executing ROS 2 service calls
+      (such as controller mode switching or input mux enabling) directly on the worker's
+      executor with bounded timeouts.
+    - Non-Atomic Publish Pipeline: Commands are verified and encoded in full before the first
+      message is published. However, multi-topic publication is not atomic at the DDS layer.
 """
 
 from __future__ import annotations
@@ -18,24 +31,34 @@ from ..._compat import BaseExceptionGroup
 from .._threaded import _ThreadedBackend
 
 if TYPE_CHECKING:
-    # Type-only imports keep this module importable without a ROS installation.
     from rclpy.node import Node
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.publisher import Publisher
 
-# rclpy's Client.wait_for_service checks availability every 0.25 s.
+# Margin in seconds added to service timeouts to accommodate rclpy's 0.25 s polling interval.
 SERVICE_POLL_MARGIN_S = 0.5
 
-# A QoS is a depth, a QoSProfile, or one of these names (YAML-friendly):
-#   "sensor_data"  rclpy's best-effort sensor profile
-#   "reliable"     reliable, volatile, keep-last 10
-#   "best_effort"  best-effort, volatile, keep-last 10
+# YAML-friendly QoS profile aliases or native depths/objects:
+#   "sensor_data": rclpy's best-effort sensor data profile (volatile, depth=10)
+#   "reliable":    reliable delivery, volatile durability, depth=10
+#   "best_effort": best-effort delivery, volatile durability, depth=10
 QoS = Any
 
 
 def resolve_qos(qos: QoS) -> Any:
-    """Turn a configured QoS into an rclpy QoS argument; call after ROS import."""
+    """Resolve a QoS descriptor (integer depth, string profile name, or QoSProfile).
+
+    Args:
+        qos: Integer history depth, string alias, or an existing QoSProfile.
+
+    Returns:
+        QoSProfile instance or integer depth suitable for rclpy subscriptions/publishers.
+
+    Raises:
+        ValueError: If qos string name is unknown or depth is not positive.
+        TypeError: If qos is boolean or an unsupported type.
+    """
     if isinstance(qos, bool):
         raise TypeError("QoS must be a depth, a profile name or a QoSProfile")
     if isinstance(qos, int):
@@ -44,6 +67,7 @@ def resolve_qos(qos: QoS) -> Any:
         return qos
     if not isinstance(qos, str):
         return qos
+
     from rclpy.qos import (
         QoSProfile,
         HistoryPolicy,
@@ -70,42 +94,49 @@ def resolve_qos(qos: QoS) -> Any:
 
 @dataclass(frozen=True)
 class RosObservation:
-    """Decode one topic into one field or a tuple-keyed group of fields.
+    """Specification for decoding a ROS 2 topic into observation fields.
 
-    String keys produce one array. Tuple keys produce a mapping with exactly
-    those names; all fields from that message share one receive timestamp. QoS
-    is explicit because sensor publishers may use best-effort delivery. A
-    decoder returns None when a message yields no sample, as a stateful video
-    decoder does before it can trust a frame; the previous sample keeps aging.
+    Attributes:
+        topic: Full ROS 2 topic path (e.g. '/tj/info/joint_feedback').
+        message_type: Generated ROS 2 message class (e.g. sensor_msgs.msg.JointState).
+        decode: Callable converting a ROS message instance into a NumPy array (for single
+            field bindings) or a dictionary mapping field names to NumPy arrays (for tuple
+            grouped bindings). Returning None indicates no sample was produced (e.g. video
+            decoder waiting for an IDR keyframe).
+        qos: Target QoS profile or depth matching the remote publisher.
+        recover_on_next_message: If True, decoding exceptions report a sample fault in read()
+            without terminating the worker thread, recovering automatically on the next valid frame.
     """
 
-    topic: str  # Full subscription topic, not a field name inferred by the backend.
-    message_type: type[Any]  # Actual ROS message class supplied by the application.
-    # A string key decodes to an array, a tuple key to those named fields;
-    # None means this message produced no sample.
+    topic: str
+    message_type: type[Any]
     decode: Callable[[Any], NDArray[Any] | Mapping[str, NDArray[Any]] | None]
-    qos: QoS = 10  # Must be compatible with the actual publisher.
+    qos: QoS = 10
     recover_on_next_message: bool = False
-    # If enabled, read() reports a bad sample until this topic decodes successfully.
 
 
 @dataclass(frozen=True)
 class RosCommand:
-    """Encode an action field/group into one topic message per complete write.
+    """Specification for encoding an action field or group into a ROS 2 command message.
 
-    stamp=True assigns header.stamp on the worker just before publication using
-    its node clock. Leave it False when the encoder owns timestamp semantics.
+    Attributes:
+        topic: Full ROS 2 actuator command topic (e.g. '/tj/control/user/joint_cmd_A').
+        message_type: Message class accepted by the remote controller (e.g. JointcmdArm).
+        encode: Callable converting an Action array or grouped dictionary into a message instance.
+        qos: Target QoS profile matching the actuator subscriber.
+        stamp: If True, assigns message.header.stamp from the backend's ROS node clock immediately
+            before publishing on the worker thread.
     """
 
-    topic: str  # Actual controller command topic.
-    message_type: type[Any]  # Message class accepted by that controller.
+    topic: str
+    message_type: type[Any]
     encode: Callable[[NDArray[Any] | Mapping[str, NDArray[Any]]], Any]
-    qos: QoS = 10  # Must be compatible with the controller's subscription.
-    stamp: bool = False  # Set header.stamp from the node clock before publishing.
+    qos: QoS = 10
+    stamp: bool = False
 
 
 def _field_keys(bindings: Mapping[str | tuple[str, ...], Any]) -> list[str]:
-    """Flatten message groups into Backend ownership without overlapping fields."""
+    """Extract and flatten field names from binding keys, asserting no overlaps."""
     keys: list[str] = []
     for key in bindings:
         fields = (key,) if isinstance(key, str) else key
@@ -120,19 +151,12 @@ def _field_keys(bindings: Mapping[str | tuple[str, ...], Any]) -> list[str]:
 
 
 class Ros2Backend(_ThreadedBackend):
-    """Own ROS resources on one worker; expose cached reads and bounded writes.
+    """ROS 2 transport session managing subscriptions, publishers, and service clients.
 
-    Construction only records bindings. connect() creates a private context,
-    node, subscriptions and publishers on the worker. read() returns cached
-    samples; each write publishes one message per binding on the worker.
-    A tuple binding can combine several fields into one message, such as two
-    arms in one feedback message, so they share a receive timestamp.
-
-    call_service() runs a service request on the same worker, so device setup
-    and stop hooks need no second ROS context or executor thread. For command
-    backends, on_stop is the application's explicit device behavior: it runs on
-    the worker with this backend and may call call_service(). A no-op hook means
-    "stop publishing" without commanding a hold, home or motor-disable.
+    Thread Model:
+        Spins a SingleThreadedExecutor on its dedicated worker thread. Subscriptions
+        cache frozen Samples with reception monotonic timestamps. Action writes encode
+        and publish topic messages sequentially under a monotonic deadline.
     """
 
     def __init__(
@@ -141,13 +165,25 @@ class Ros2Backend(_ThreadedBackend):
         observations: Mapping[str | tuple[str, ...], RosObservation],
         actions: Mapping[str | tuple[str, ...], RosCommand],
         on_stop: Callable[[Ros2Backend], None] | None = None,
-        # Mandatory for command backends; bounded by stop_timeout_s.
-        node_name: str = "phyai_robot",  # Node owned exclusively by this backend.
-        io_timeout_s: float = 0.1,  # Bound for publishing one command.
-        stop_timeout_s: float | None = None,  # Bound for on_stop; None = io.
-        connect_timeout_s: float = 5.0,  # Context/node/executor initialization budget.
-        domain_id: int | None = None,  # None uses the native ROS environment.
+        # Mandatory for backends owning action commands; called on worker during stop.
+        node_name: str = "phyai_robot",
+        io_timeout_s: float = 0.1,
+        stop_timeout_s: float | None = None,
+        connect_timeout_s: float = 5.0,
+        domain_id: int | None = None,  # None inherits ROS_DOMAIN_ID from environment.
     ) -> None:
+        """Initialize ROS 2 session bindings without creating native handles.
+
+        Args:
+            observations: Mapping of field names (or tuples) to RosObservation specs.
+            actions: Mapping of command names (or tuples) to RosCommand specs.
+            on_stop: Safety callback invoked on the worker during stop/close.
+            node_name: Unique name for this backend's ROS 2 node.
+            io_timeout_s: Maximum budget for publishing single-tick commands.
+            stop_timeout_s: Maximum budget for on_stop (service handshakes).
+            connect_timeout_s: Budget for worker and context initialization.
+            domain_id: ROS 2 domain ID (0-232), or None for shell default.
+        """
         if actions and on_stop is None:
             raise ValueError("ROS command backends require a device-specific on_stop")
         super().__init__(
@@ -164,15 +200,15 @@ class Ros2Backend(_ThreadedBackend):
         self._domain_id = domain_id
         self._on_stop = on_stop
         self._node_name = node_name
-        # Private ROS context; never shut down another user's context.
+
         self._context: Context | None = None
         self._node: Node | None = None
         self._executor: SingleThreadedExecutor | None = None
-        # Accessed only on the worker.
         self._publishers: dict[str | tuple[str, ...], Publisher[Any]] = {}
         self._service_clients: dict[str, Any] = {}
 
     def _open(self) -> None:
+        """Initialize private rclpy context, node, subscriptions, and publishers."""
         try:
             from rclpy.node import Node
             from rclpy.context import Context
@@ -187,17 +223,20 @@ class Ros2Backend(_ThreadedBackend):
                     "the ros2 extra does not install ROS middleware"
                 ) from error
             raise
-        context: Context = Context()
+
+        context = Context()
         self._context = context
         context.init(
             args=[],
             **({"domain_id": self._domain_id} if self._domain_id is not None else {}),
         )
-        node: Node = Node(self._node_name, context=context, use_global_arguments=False)
+        node = Node(self._node_name, context=context, use_global_arguments=False)
         self._node = node
-        executor: SingleThreadedExecutor = SingleThreadedExecutor(context=context)
+        executor = SingleThreadedExecutor(context=context)
         self._executor = executor
         executor.add_node(node)
+
+        # Create topic subscriptions.
         for key, spec in self._observations.items():
 
             def receive(
@@ -205,7 +244,6 @@ class Ros2Backend(_ThreadedBackend):
                 key: str | tuple[str, ...] = key,
                 spec: RosObservation = spec,
             ) -> None:
-                # Message classes vary by topic; the application owns each codec.
                 received_at_ns: int = time.monotonic_ns()
                 try:
                     decoded = spec.decode(message)
@@ -232,23 +270,20 @@ class Ros2Backend(_ThreadedBackend):
             node.create_subscription(
                 spec.message_type, spec.topic, receive, resolve_qos(spec.qos)
             )
+
+        # Create topic publishers.
         for key, spec in self._actions.items():
             self._publishers[key] = node.create_publisher(
                 spec.message_type, spec.topic, resolve_qos(spec.qos)
             )
 
     def _poll(self) -> None:
-        # A short spin lets the same thread service requests promptly.
-        # Unrecoverable callback exceptions become observable worker faults.
-        assert self._executor is not None  # _open completed on this worker.
+        """Spin executor briefly on worker thread to dispatch subscription callbacks."""
+        assert self._executor is not None
         self._executor.spin_once(timeout_sec=0.001)
 
     def read(self) -> Mapping[str, Sample]:
-        """Report a recoverable decode error until that binding receives valid data.
-
-        This does not reconnect or retry a command. Other topics cannot clear
-        the error, and the inherited worker/connection failures still propagate.
-        """
+        """Return cached samples, propagating any active recoverable decode errors."""
         samples = super().read()
         with self._lock:
             if self._decode_errors:
@@ -258,13 +293,21 @@ class Ros2Backend(_ThreadedBackend):
     def call_service(
         self, service_type: type[Any], name: str, request: Any, *, timeout_s: float
     ) -> Any:
-        """Call a service on the worker with one end-to-end deadline.
+        """Call a ROS 2 service synchronously on this backend's worker thread.
 
-        timeout_s covers waiting for the server and for its response. A timeout
-        cannot undo a request the server may already have applied. A response
-        with success == False raises RuntimeError with the server's message.
+        Args:
+            service_type: Generated ROS service type (e.g. std_srvs.srv.Trigger).
+            name: Full ROS service topic path (e.g. '/tj/control/set_mode').
+            request: Service Request instance.
+            timeout_s: End-to-end deadline covering service discovery and response.
+
+        Returns:
+            Service response object.
+
+        Raises:
+            TimeoutError: If service is not available or does not reply before timeout.
+            RuntimeError: If response has success=False.
         """
-        # rclpy polls service availability in 0.25 s steps; allow for that.
         return self.call(
             lambda: self._call_service(service_type, name, request, timeout_s),
             timeout_s + SERVICE_POLL_MARGIN_S,
@@ -279,16 +322,19 @@ class Ros2Backend(_ThreadedBackend):
         if client is None:
             client = self._node.create_client(service_type, name)
             self._service_clients[name] = client
+
         if not client.wait_for_service(timeout_sec=timeout_s):
             raise TimeoutError(f"ROS service {name} is not available")
+
         future = client.call_async(request)
         remaining = deadline - time.monotonic()
         if remaining > 0:
-            # Not re-entrant: requests run between spins, never inside a callback.
             self._executor.spin_until_future_complete(future, timeout_sec=remaining)
+
         if not future.done():
             client.remove_pending_request(future)
             raise TimeoutError(f"ROS service {name} did not respond in time")
+
         response = future.result()
         if response is None:
             raise RuntimeError(f"ROS service {name} returned no response")
@@ -298,8 +344,7 @@ class Ros2Backend(_ThreadedBackend):
         return response
 
     def _write_device(self, action: Action, deadline: float) -> None:
-        # Grouped bindings use declaration order, independent of field-set order.
-        # Single-field callers retain their original publication order.
+        """Encode and publish single-step commands across all owned action topics."""
         keys = self._actions if self._grouped_actions else action
         messages = {
             key: self._actions[key].encode(
@@ -309,8 +354,8 @@ class Ros2Backend(_ThreadedBackend):
             )
             for key in keys
         }
-        # Encode every field before publishing any of them. Publishing two topics
-        # still is not atomic and does not guarantee simultaneous physical motion.
+
+        # Verify message types and stamp presence prior to emitting any message.
         for key, message in messages.items():
             if not isinstance(message, self._actions[key].message_type):
                 raise TypeError(f"{key}: encoder returned the wrong ROS message type")
@@ -318,6 +363,8 @@ class Ros2Backend(_ThreadedBackend):
                 getattr(message, "header", None), "stamp"
             ):
                 raise TypeError(f"{key}: stamped commands require header.stamp")
+
+        # Publish messages sequentially.
         for key, message in messages.items():
             if time.monotonic() >= deadline:
                 raise TimeoutError("ROS command task expired before publishing")
@@ -326,13 +373,12 @@ class Ros2Backend(_ThreadedBackend):
             self._publishers[key].publish(message)
 
     def _stop_device(self) -> None:
+        """Execute safety callback on the worker thread during stop or shutdown."""
         if self._node is not None and self._on_stop is not None:
-            # Runs on this worker; call_service() executes inline here.
             self._on_stop(self)
 
     def _close_device(self) -> None:
-        # Independent cleanup keeps a failed executor shutdown from leaking the
-        # owned node/context. Do not call the global rclpy.shutdown().
+        """Shutdown executor, destroy node, and terminate private rclpy context."""
         errors: list[BaseException] = []
         for cleanup in (
             lambda: (
@@ -345,7 +391,7 @@ class Ros2Backend(_ThreadedBackend):
         ):
             try:
                 cleanup()
-            except BaseException as error:  # noqa: BLE001 - preserve failures across cleanup/thread boundaries
+            except BaseException as error:  # noqa: BLE001
                 errors.append(error)
         if errors:
             raise BaseExceptionGroup("ROS resource cleanup failed", errors)
@@ -360,11 +406,21 @@ def image_backends(
     qos: QoS = "sensor_data",
     **options: Any,
 ) -> list[Ros2Backend]:
-    """Build one observation-only backend per camera field.
+    """Create a list of observation-only backends, allocating one dedicated worker per camera.
 
-    Each backend decodes on its own worker, so expensive image conversion for
-    one camera never delays another camera or a command backend. options are
-    passed to every Ros2Backend (for example domain_id and io_timeout_s).
+    Prevents CPU-heavy image decoding/letterboxing on one camera from delaying frame
+    arrival on other cameras or stalling actuator command dispatch.
+
+    Args:
+        topics: Mapping of observation field names to ROS image topic strings.
+        message_type: Image message class (e.g. sensor_msgs.msg.Image).
+        decode: Image decoder function producing an HWC uint8 array.
+        node_name: Base node name prefix.
+        qos: Subscriber QoS profile.
+        options: Additional backend parameters forwarded to each Ros2Backend.
+
+    Returns:
+        List of configured Ros2Backend instances ready to be passed to CompositeRobot.
     """
     return [
         Ros2Backend(

@@ -1,14 +1,26 @@
-"""Action-chunk scheduling: when to predict and which command each tick sends.
+"""Action-chunk scheduling: coordinating model predictions with actuator control ticks.
 
-RobotDeployment owns threads, robot I/O and the control clock. A Scheduler owns
-only the action timeline. Every method is called while the deployment holds its
-condition lock, so implementations need no synchronization of their own and
-must return quickly.
+Architecture:
+    In phyai-robot, hardware control execution is decoupled into two independent domains:
+    1. Execution Loop (`RobotDeployment`): Manages threads, physical I/O locks, hardware
+       timing (at `control_hz`), and graceful shutdown sequences.
+    2. Trajectory Scheduling (`Scheduler`): Dictates the action timeline — determining when
+       to request new inference snapshots, accepting incoming predictions, and computing
+       the exact interpolated command to dispatch at any control tick timestamp.
 
-StopAndRefill is the default strategy. Real-time chunking (RTC) fits the same
-protocol: request inference while a chunk is still executing, report the
-targets that will run during inference through InferenceContext.pending, and
-merge the new chunk in add_chunk without ever becoming inactive.
+    All methods on `Scheduler` are invoked exclusively while `RobotDeployment` holds its
+    internal synchronization Condition lock. Consequently:
+    - Schedulers do not need internal locks or thread-synchronization primitives.
+    - Schedulers must execute synchronously in constant time (O(1)) without I/O.
+
+Available Schedulers:
+    - `StopAndRefill` (Default): Traditional chunk-by-chunk execution. The robot executes
+      an action prefix, halts motion when the chunk drains, acquires a fresh sensor snapshot,
+      queries the model policy, and resumes execution.
+    - `Real-Time Chunking (RTC)`: Schedulers implementing continuous motion query inference
+      while the current trajectory prefix is still executing. The `InferenceContext.pending`
+      tuple provides the model adapter with the exact future actions scheduled to run
+      during the model forward pass, enabling smooth trajectory splicing.
 """
 
 from __future__ import annotations
@@ -25,68 +37,111 @@ from .types import Action, ActionChunk, ActionSchema
 
 @dataclass(frozen=True)
 class InferenceContext:
-    """The scheduler's state when an inference snapshot is taken.
+    """Snapshot context provided to PolicyAdapter when initiating inference.
 
-    pending holds the source targets that will still be executed after the
-    snapshot, in order. An RTC adapter can pass them to a guided model. The
-    default stop-and-refill strategy never executes during inference, so its
-    context is always empty.
+    Attributes:
+        pending: Ordered tuple of single-tick physical actions that are currently scheduled
+            to execute on hardware while the background model prediction is running.
+            - In `StopAndRefill`, motion is paused during inference, so `pending` is empty.
+            - In Real-Time Chunking (RTC), `pending` contains the unexecuted tail of the
+              current chunk, allowing guided diffusion models to condition on future motion.
     """
 
     pending: tuple[Action, ...] = ()
 
 
 class Scheduler(Protocol):
-    """Own the action timeline between predictions and control ticks."""
+    """Protocol governing the trajectory timeline between predictions and actuator ticks.
+
+    All methods are invoked by RobotDeployment while holding its internal condition lock.
+    """
 
     def bind(self, action_schema: ActionSchema) -> None:
-        """Validate the strategy settings against the robot's command fields."""
+        """Validate and bind strategy settings against the robot's physical action schema.
+
+        Called during RobotDeployment initialization. Schedulers inspect action_schema to
+        identify continuous floating-point fields eligible for linear interpolation.
+        """
         ...
 
     def check(self, chunk: ActionChunk) -> None:
-        """Reject a validated chunk that this strategy cannot execute."""
+        """Verify that an incoming predicted chunk satisfies strategy prerequisites.
+
+        Raises:
+            ValueError: If the chunk contains fewer targets than execution_horizon.
+        """
         ...
 
     def wants_inference(self) -> bool:
-        """Return whether the worker should take a snapshot and predict now."""
+        """Query whether the background worker thread should trigger a new prediction now."""
         ...
 
     def begin_inference(self, now_ns: int) -> InferenceContext:
-        """Record that a snapshot was taken at now_ns and describe pending work."""
+        """Record that an observation snapshot was taken and return the active context.
+
+        Args:
+            now_ns: Monotonic timestamp in nanoseconds when the observation was captured.
+
+        Returns:
+            InferenceContext describing pending actions executing during this inference.
+        """
         ...
 
     def add_chunk(
         self, chunk: ActionChunk, context: InferenceContext, now_ns: int
     ) -> None:
-        """Accept the prediction made for context; now_ns is its arrival time."""
+        """Enqueue or splice a newly received action prediction into the timeline.
+
+        Args:
+            chunk: Validated ActionChunk returned by PolicyAdapter.to_actions().
+            context: The InferenceContext originally returned by begin_inference().
+            now_ns: Monotonic timestamp in nanoseconds when the prediction arrived.
+        """
         ...
 
     def is_active(self) -> bool:
-        """Return whether action_at may produce commands without new input."""
+        """Return True if the scheduler has actions available to dispatch via action_at()."""
         ...
 
     def action_at(self, tick_ns: int) -> Action | None:
-        """Return the command scheduled for tick_ns, or None to stop sending.
+        """Compute the interpolated actuator command scheduled for host timestamp tick_ns.
 
-        Returning None ends the active period. The deployment restarts its
-        control clock when the scheduler becomes active again.
+        Args:
+            tick_ns: Monotonic timestamp in nanoseconds of the current control tick.
+
+        Returns:
+            Action mapping with interpolated targets, or None to signal the end of the active
+            chunk (transitioning the deployment control loop to idle).
         """
         ...
 
 
-def interpolate(left: Action, right: Action, fraction: float, keys: frozenset[str]):
-    """Linear interpolation for continuous absolute targets; hold other fields.
+def interpolate(
+    left: Action, right: Action, fraction: float, keys: frozenset[str]
+) -> Action:
+    """Perform linear convex interpolation for continuous targets; hold discrete fields.
 
-    Convex interpolation never overshoots either endpoint, unlike an arbitrary
-    spline. This is joint/normalized-gripper interpolation, not an SE(3) pose
-    interpolator or a velocity limiter. The result arrays are read-only.
+    Mathematical guarantee:
+        Convex interpolation: target = (1 - fraction) * left + fraction * right.
+        Never overshoots either endpoint, unlike cubic splines or polynomial fits.
+        Continuous fields listed in `keys` are linearly blended in float64 arithmetic to
+        prevent intermediate precision overflow, then cast back to the field's native dtype.
+        Fields not in `keys` perform zero-order sample-and-hold (retaining values from `left`).
+
+    Args:
+        left: Starting target Action at fraction = 0.0.
+        right: Ending target Action at fraction = 1.0.
+        fraction: Normalized temporal progress in [0.0, 1.0].
+        keys: Set of action field names configured for continuous interpolation.
+
+    Returns:
+        Complete Action mapping containing interpolated array values (read-only buffers).
     """
     if fraction == 0 or left is right:
         return left
     values: dict[str, Any] = dict(left)
     for key in keys:
-        # Work in float64 to avoid overflow in lower-precision schemas, then
-        # restore the schema's dtype.
+        # Compute in float64 to prevent numeric overflow on float16/float32 schemas.
         value = (
             (1 - fraction) * left[key].astype(np.float64)
             + fraction * right[key].astype(np.float64)
@@ -97,23 +152,35 @@ def interpolate(left: Action, right: Action, fraction: float, keys: frozenset[st
 
 
 class StopAndRefill:
-    """Execute one prefix completely, then pause sending until the next chunk.
+    """Chunk-by-chunk scheduling: execute an action prefix, halt, refill, and repeat.
 
-    Target i is due i / action_hz seconds after the chunk's first control tick;
-    the chunk covers [0, N / action_hz), so the final target is held for one
-    source interval. The worker predicts only after a chunk fully drains, so
-    observation and inference never overlap motion and no command is sent
-    between chunks. This is not RTC or a hard real-time scheduler.
+    Execution Invariants:
+    1. Action Consumption: Target i is scheduled at host time `start_ns + i / action_hz`.
+       The chunk duration spans `[0, execution_horizon / action_hz)`.
+    2. Tail Holding: The final retained target is held constant across its final interval;
+       interpolation never drifts toward unpredicted or discarded horizons.
+    3. Motion Separation: Inference occurs strictly when the previous chunk has drained.
+       Actuation is suspended during observation acquisition and model forward pass,
+       eliminating sensor-actuator race conditions without complex queuing.
     """
 
     def __init__(
         self,
         *,
-        action_hz: float,  # Rate at which source targets are consumed.
-        execution_horizon: int | None = None,  # Prefix length; None keeps all.
-        interpolate_keys: Iterable[str] | None = None,
-        # Continuous fields; None selects every floating-point command field.
+        action_hz: float,  # Consumption rate of model targets in Hz (e.g. 25.0 Hz).
+        execution_horizon: int | None = None,  # Number of targets to execute per chunk.
+        interpolate_keys: Iterable[str]
+        | None = None,  # Continuous fields (None = all floats).
     ) -> None:
+        """Initialize StopAndRefill scheduler.
+
+        Args:
+            action_hz: Target consumption frequency in Hz (must be positive and finite).
+            execution_horizon: Integer count of leading targets to execute from each chunk.
+                If None, the entire predicted chunk horizon is executed.
+            interpolate_keys: Optional collection of field names to interpolate. If None,
+                all floating-point fields in the action schema are automatically selected.
+        """
         if (
             isinstance(action_hz, bool)
             or not math.isfinite(action_hz)
@@ -124,6 +191,7 @@ class StopAndRefill:
             type(execution_horizon) is not int or execution_horizon < 1
         ):
             raise ValueError("execution_horizon must be a positive integer or None")
+
         self.action_hz = float(action_hz)
         self.execution_horizon = execution_horizon
         self._requested_keys = (
@@ -134,6 +202,7 @@ class StopAndRefill:
         self._start_ns: int | None = None
 
     def bind(self, action_schema: ActionSchema) -> None:
+        """Inspect action_schema to identify floating-point fields for interpolation."""
         floating = {
             key
             for key, spec in action_schema.items()
@@ -149,6 +218,7 @@ class StopAndRefill:
         self._keys = self._requested_keys
 
     def check(self, chunk: ActionChunk) -> None:
+        """Verify that the predicted chunk contains at least execution_horizon targets."""
         if self.execution_horizon is not None and (
             len(chunk.actions) < self.execution_horizon
         ):
@@ -158,32 +228,39 @@ class StopAndRefill:
             )
 
     def wants_inference(self) -> bool:
+        """Trigger inference only when the previous chunk has completely drained."""
         return self._chunk is None
 
     def begin_inference(self, now_ns: int) -> InferenceContext:
+        """Return empty context because no actions execute during StopAndRefill inference."""
         return InferenceContext()
 
     def add_chunk(
         self, chunk: ActionChunk, context: InferenceContext, now_ns: int
     ) -> None:
+        """Store the retained prefix of the predicted chunk; clock starts on first tick."""
         self.check(chunk)
         self._chunk = chunk.actions[: self.execution_horizon]
-        self._start_ns = None  # The first control tick starts this chunk's clock.
+        self._start_ns = None  # Reset chunk clock; set upon first call to action_at().
 
     def is_active(self) -> bool:
+        """Return True while a chunk is loaded and executing."""
         return self._chunk is not None
 
     def action_at(self, tick_ns: int) -> Action | None:
+        """Compute the linearly interpolated action target for monotonic timestamp tick_ns."""
         if self._chunk is None:
             return None
         if self._start_ns is None:
             self._start_ns = tick_ns
+
+        # Compute fractional position in target steps: position = dt * action_hz.
         position = (tick_ns - self._start_ns) * self.action_hz / 1e9
         if position >= len(self._chunk):
-            # The final interval has elapsed. Becoming inactive lets the worker
-            # observe; nothing is sent until the next chunk arrives.
+            # Chunk duration has elapsed. Transition to idle to trigger next observation.
             self._chunk = self._start_ns = None
             return None
+
         index = math.floor(position)
         left = self._chunk[index]
         right = self._chunk[min(index + 1, len(self._chunk) - 1)]

@@ -1,16 +1,27 @@
-"""PhyAI pi0.5 model server policy: preprocessing, engine and postprocessing.
+"""PhyAI Pi0.5 model server policy: preprocessing, engine, and postprocessing.
 
-Everything here is defined by the checkpoint, never by a robot. Requests are
-named model arrays: one RGB uint8 image per checkpoint camera ("image.<name>")
-and the raw state vector ("state"), in the dataset's order and units. Replies
-contain absolute "actions" with shape (horizon, action_dim) in the same
-convention. Robot field names, units and calibration live in the robot client.
+Design Rationale:
+    This module encapsulates all checkpoint-specific mathematical and tensor operations
+    on the model server side. It is 100% embodiment-agnostic (zero imports of robot
+    drivers, ROS 2, or robot-specific hardware parameters).
 
-Two export formats are supported:
-- lerobot style: policy_preprocessor.json / policy_postprocessor.json. Their
-  pipelines own normalization and, when exported, delta-to-absolute decoding.
-- metadata style: norm_stats.json plus deployment_metadata.json (or exactly
-  one *_metadata.json) declaring cameras, action_dim, delta_mask and norm_eps.
+Protocol Contract (VLA Vector Interface):
+    - Request: Input dictionary mapping feature keys to NumPy arrays:
+        - 'image.<camera_name>': HWC uint8 RGB image array per checkpoint camera
+        - 'state': 1D float32 array containing the concatenated physical state vector
+    - Response: Output dictionary containing:
+        - 'actions': 2D array of shape (action_horizon, action_dim) containing absolute
+          unnormalized actuator targets in physical engineering units.
+
+Dual Export Format Support:
+    1. LeRobot Format (AgileX / Enactive):
+       Identified by the presence of `policy_preprocessor.json` and `policy_postprocessor.json`.
+       The serialized pipelines handle quantile normalization, custom prompt encoding,
+       and internal DeltaActionStep target restoration.
+    2. Metadata Format (Tianji / RLinf / OpenPI JAX):
+       Identified by `norm_stats.json` plus `deployment_metadata.json` (or `*_metadata.json`).
+       Uses high-precision float64 quantile statistics (eps=1e-6) and applies delta_mask
+       anchoring to reconstruct absolute joint positions from predicted deltas.
 """
 
 from __future__ import annotations
@@ -34,23 +45,28 @@ from .configuration import repository_path
 
 @dataclass
 class Pi05PolicyConfig:
-    """Local checkpoint and PhyAI engine settings."""
+    """Configuration dataclass for Pi0.5 model weights and the PhyAI inference engine.
 
-    # Required local export directory, resolved relative to the checkout root.
+    Attributes:
+        checkpoint: Local path or repo path to the exported Pi0.5 checkpoint directory.
+            Must contain config.json, safetensors model weights, norm_stats.json, and tokenizer files.
+        kernel_policy: Path to kernel selection YAML policy enforcing exact GELU implementations.
+        seed: Random seed for the CPU diffusion initial Gaussian noise generator.
+        num_inference_steps: Number of Euler integration steps during flow-matching denoising.
+            Set to null to use the checkpoint's native default (e.g. 5 steps for Tianji, 10 for AgileX).
+        use_cuda_graph: Enable CUDA graph capture and replay for minimized execution jitter.
+        num_threads: Number of CPU worker threads allocated to the PhyAI engine runtime.
+    """
+
     checkpoint: str = MISSING
-    # Operator-level kernel selection is kept separate from model weights.
     kernel_policy: str = "examples/deployment/configs/pi05_bf16.yaml"
-    # Seed one CPU generator per run; do not reseed before every prediction.
     seed: int = 42
-    # Flow-matching Euler updates per prediction, not the action horizon.
-    # None keeps the checkpoint's value; changing it needs a new engine.
     num_inference_steps: int | None = None
     use_cuda_graph: bool = True
-    # PhyAI runtime CPU threads.
     num_threads: int = 16
 
     def validate(self) -> None:
-        """Check local paths and engine arguments without allocating GPU resources."""
+        """Validate configuration paths and parameters without allocating GPU memory."""
         if self.num_inference_steps is not None and self.num_inference_steps < 1:
             raise ValueError("policy.num_inference_steps must be positive or null")
         if self.num_threads < 1:
@@ -65,23 +81,31 @@ class Pi05PolicyConfig:
 
 @dataclass
 class Pi05ProcessorConfig:
-    """Model-contract details that an export may not record itself."""
+    """Configuration options for model tokenization, normalization, and image geometry.
 
-    # Null keeps Pi05Processing. Otherwise use module:factory or file.py:factory.
+    Attributes:
+        factory: Optional custom processor factory specification ('module:Class' or 'path.py:Class').
+            Null selects the default Pi05Processing wrapper.
+        options: Extra keyword arguments passed exclusively to an external custom factory.
+        camera_names: Ordered list of camera view names expected by the model vision tower.
+            Required for LeRobot exports; verified against deployment metadata for RLinf exports.
+        action_dim: Unpadded physical action dimensionality (e.g. 14 for AgileX, 16 for Tianji).
+            Required for LeRobot exports; verified against deployment metadata for RLinf exports.
+        metadata_file: Relative filename of export metadata JSON inside checkpoint directory.
+            If null, automatically discovers deployment_metadata.json or unique *_metadata.json.
+        image_resize_backend: Resizing implementation ('pil' or 'torch').
+            'pil' is recommended to preserve exact training-time PIL bilinear rounding.
+    """
+
     factory: str | None = None
-    # Extra keyword arguments for the external factory.
     options: dict[str, Any] = field(default_factory=dict)
-    # Camera names in model order. Required for lerobot-style exports; must
-    # match a metadata-style export when given.
     camera_names: list[str] | None = None
-    # Real action/state dimension. Required for lerobot-style exports.
     action_dim: int | None = None
-    # Metadata JSON relative to the checkpoint; null discovers it.
     metadata_file: str | None = None
-    # PIL matches clients that pre-resize with phyai_robot.images.
     image_resize_backend: str = "pil"
 
     def validate(self) -> None:
+        """Verify that processor configuration options are well-formed."""
         if self.factory is not None and (
             not self.factory.strip() or ":" not in self.factory
         ):
@@ -106,7 +130,7 @@ class Pi05ProcessorConfig:
 
 
 def _read_metadata(checkpoint: Path, metadata_file: str | None) -> dict[str, Any]:
-    """Load and check a metadata-style export without assuming an embodiment."""
+    """Discover and parse checkpoint export metadata JSON for metadata-style checkpoints."""
     if metadata_file is not None:
         path = checkpoint / Path(metadata_file).expanduser()
     elif (checkpoint / "deployment_metadata.json").is_file():
@@ -116,11 +140,13 @@ def _read_metadata(checkpoint: Path, metadata_file: str | None) -> dict[str, Any
         if len(candidates) != 1:
             raise ValueError("set processor.metadata_file: expected one metadata JSON")
         path = candidates[0]
+
     metadata = json.loads(path.read_text())
     action_dim = metadata.get("action_dim")
     names = metadata.get("camera_names")
     mask = metadata.get("delta_mask")
     eps = metadata.get("norm_eps")
+
     if type(action_dim) is not int or action_dim < 1:
         raise ValueError("checkpoint action_dim must be a positive integer")
     if (
@@ -147,11 +173,16 @@ def _read_metadata(checkpoint: Path, metadata_file: str | None) -> dict[str, Any
 
 
 class Pi05Processing:
-    """Checkpoint-defined conversion between model arrays and engine tensors."""
+    """Encapsulates image preprocessing, state/action normalization, and tokenization."""
 
     def __init__(
         self, checkpoint: Path, *, task: str, config: Pi05ProcessorConfig
     ) -> None:
+        """Initialize preprocessor and postprocessor pipelines for a Pi0.5 checkpoint.
+
+        Inspects the checkpoint directory to determine whether it follows LeRobot format
+        or OpenPI metadata format, configuring the appropriate processor steps.
+        """
         import torch
         from phyai_utils_tools.models.pi05 import PI05Processor
         from phyai_utils_tools.processing.steps import NormalizerStep, UnnormalizerStep
@@ -161,7 +192,9 @@ class Pi05Processing:
         self.task = task.strip()
         self._torch = torch
         self.metadata: dict[str, Any] = {}
+
         if (checkpoint / "policy_preprocessor.json").is_file():
+            # Format A: LeRobot pipeline export (e.g. AgileX Enactive).
             if (
                 config.metadata_file is not None
                 or (checkpoint / "deployment_metadata.json").is_file()
@@ -185,9 +218,12 @@ class Pi05Processing:
             for name, value in (("camera_names", names), ("action_dim", width)):
                 if name in self.metadata and value != self.metadata[name]:
                     raise ValueError(f"processor.{name} differs from the checkpoint")
+
             self.camera_names = list(names)
             self.action_dim = width
-            self._delta_mask = None  # The exported postprocessor decodes deltas.
+            self._delta_mask = (
+                None  # DeltaActionStep is serialized inside policy_postprocessor.json.
+            )
             self._processor = PI05Processor.from_pretrained(
                 checkpoint,
                 tokenizer_name=str(checkpoint),
@@ -201,21 +237,23 @@ class Pi05Processing:
             if self.action_dtype not in ("float32", "float64"):
                 raise ValueError("checkpoint action_dtype must be float32 or float64")
         else:
+            # Format B: Metadata export (e.g. Tianji RLinf / OpenPI JAX).
             metadata = _read_metadata(checkpoint, config.metadata_file)
             self.metadata = metadata
             self.camera_names = list(metadata["camera_names"])
             self.action_dim = metadata["action_dim"]
+
             for name, value in (
                 ("camera_names", config.camera_names),
                 ("action_dim", config.action_dim),
             ):
                 if value is not None and value != metadata[name]:
                     raise ValueError(f"processor.{name} differs from the checkpoint")
+
             self._delta_mask = torch.tensor(metadata["delta_mask"], dtype=torch.bool)
-            # Exported statistics are named "state" and "actions"; the shared
-            # processor expects canonical feature names.
-            stats = json.loads((checkpoint / "norm_stats.json").read_text())
-            stats = stats["norm_stats"]
+            stats = json.loads((checkpoint / "norm_stats.json").read_text())[
+                "norm_stats"
+            ]
             self._processor = PI05Processor(
                 tokenizer_name=str(checkpoint),
                 num_images=len(self.camera_names),
@@ -228,8 +266,7 @@ class Pi05Processing:
                 image_resize_backend=config.image_resize_backend,
                 params_dtype=torch.float32,
             )
-            # Keep the export's float64 statistics and epsilon: float32
-            # normalization can change tokenized state and predictions.
+            # Enforce high-precision float64 quantile normalization and exact epsilon parity.
             for pipeline in (
                 self._processor.preprocessor,
                 self._processor.postprocessor,
@@ -241,14 +278,17 @@ class Pi05Processing:
                     for step in pipeline.steps
                 ]
             self.action_dtype = "float64"
+
         trained_tasks = self.metadata.get("trained_tasks")
         if trained_tasks is not None and (
             not isinstance(trained_tasks, list) or self.task not in trained_tasks
         ):
             raise ValueError("task is not one of the checkpoint's trained instructions")
+
         self.image_size = int(self._processor.image_size)
 
     def input_schema(self) -> dict[str, FeatureSpec]:
+        """Generate the FeatureSpec mapping describing expected model inputs."""
         image = FeatureSpec((self.image_size, self.image_size, 3), "uint8")
         return {
             **{IMAGE_PREFIX + name: image for name in self.camera_names},
@@ -256,8 +296,9 @@ class Pi05Processing:
         }
 
     def preprocess(self, inputs: Mapping[str, NDArray[Any]]) -> Any:
+        """Run raw camera arrays, language instruction, and state through PI05Processor."""
         torch = self._torch
-        # Copy read-only wire buffers before handing them to torch.
+        # Copy NumPy arrays to avoid PyTorch mutating read-only wire buffers.
         images = [
             torch.from_numpy(np.array(inputs[IMAGE_PREFIX + name]))
             .permute(2, 0, 1)
@@ -270,18 +311,27 @@ class Pi05Processing:
         )
 
     def postprocess(self, normalized: Any, state: NDArray[np.float32]) -> NDArray[Any]:
-        """Unnormalize and anchor relative targets to the request's raw state."""
+        """Unnormalize action predictions and anchor joint deltas to the request state.
+
+        Args:
+            normalized: Raw model output tensor from engine.step().
+            state: The exact 1D float32 state vector received in the inference request.
+
+        Returns:
+            NumPy array of shape (action_horizon, action_dim) containing absolute targets.
+        """
         torch = self._torch
         if self._delta_mask is None:
+            # LeRobot path: postprocessor contains DeltaActionStep.
             actions = self._processor.postprocess(
                 {"action": normalized, "state": np.array(state)}
             )
         else:
+            # Metadata path: slice padding, unnormalize, then anchor delta masked dimensions.
             actions = self._processor.postprocess(normalized[..., : self.action_dim])
-            # One anchor for the whole horizon: deltas are relative to the
-            # observed pose, not increments to be summed over time.
             anchor = torch.as_tensor(np.array(state), dtype=actions.dtype)
             actions = actions + torch.where(self._delta_mask, anchor, 0)[..., None, :]
+
         values = actions.detach().cpu().numpy().astype(self.action_dtype)[0]
         if not np.isfinite(values).all():
             raise ValueError("model produced non-finite actions")
@@ -289,14 +339,10 @@ class Pi05Processing:
 
 
 class Pi05Policy:
-    """Own one BF16 PhyAI engine, its processing and a seeded noise stream.
-
-    PolicyServer calls predict synchronously. A lock serializes the engine, its
-    graph buffers and the generator. close may run while predict is still
-    active; engine destruction is then deferred to the predicting thread.
-    """
+    """Manages the resident PhyAI Pi0.5 inference engine and reproducible noise stream."""
 
     def __init__(self, config: Pi05PolicyConfig, processing: Pi05Processing) -> None:
+        """Load Pi0.5 weights and initialize the PhyAI execution engine."""
         import torch
         from phyai.utils import load_config
         from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
@@ -304,29 +350,30 @@ class Pi05Policy:
         from phyai.models.pi05.main_pi05 import PI05Args
         from phyai.models.pi05.scheduler_pi05 import PI05Request
         from phyai.models.pi05.configuration_pi05 import PI05Config
-
         from phyai import Engine, EngineArgs
 
         checkpoint = repository_path(config.checkpoint)
         model_config = load_config(checkpoint, PI05Config)
         if config.num_inference_steps is not None:
-            # The plugin builds time embeddings and captures N Euler steps at
-            # construction, so the override must happen before Engine(...).
+            # Override flow-matching Euler steps before engine initialization.
             model_config = replace(
                 model_config, num_inference_steps=config.num_inference_steps
             )
+
         self.processing = processing
         self.num_inference_steps = int(model_config.num_inference_steps)
         self.horizon = int(model_config.chunk_size)
         expected = processing.metadata.get("action_horizon", self.horizon)
         if expected != self.horizon:
             raise ValueError("checkpoint metadata horizon differs from chunk_size")
+
         self._torch = torch
         self._request_type = PI05Request
         self._max_action_dim = int(model_config.max_action_dim)
-        # CPU noise is independent of the engine's CUDA RNG state.
         self._seed = config.seed
         self._generator = torch.Generator().manual_seed(config.seed)
+
+        # Initialize the high-performance PhyAI CUDA inference engine.
         self._engine = Engine(
             EngineArgs(
                 plugin="pi05",
@@ -350,6 +397,7 @@ class Pi05Policy:
         self._closed = False
 
     def spec(self, metadata: Mapping[str, Any]) -> PolicySpec:
+        """Assemble the complete PolicySpec describing model inputs, outputs, and metadata."""
         processing = self.processing
         return PolicySpec(
             inputs=processing.input_schema(),
@@ -368,13 +416,18 @@ class Pi05Policy:
         )
 
     def predict(self, inputs: Mapping[str, NDArray[Any]]) -> dict[str, NDArray[Any]]:
+        """Synchronously execute preprocessing, Euler denoising, and postprocessing.
+
+        Must be called while holding self._lock. Generates deterministic Gaussian noise
+        for the full chunk horizon using the CPU generator stream.
+        """
         torch = self._torch
         with self._lock:
             if self._close_requested.is_set():
                 raise RuntimeError("Pi05Policy is closed")
             try:
                 processed = self.processing.preprocess(inputs)
-                # Fresh noise for the whole horizon, not just an executed prefix.
+                # Sample initial Gaussian noise (shape: (1, horizon, max_action_dim)).
                 noise = torch.randn(
                     1,
                     self.horizon,
@@ -383,7 +436,6 @@ class Pi05Policy:
                     dtype=torch.float32,
                 )
                 with torch.inference_mode():
-                    # Detach from reusable CUDA-graph output buffers.
                     normalized = (
                         self._engine.step(
                             self._request_type(
@@ -400,25 +452,24 @@ class Pi05Policy:
                 actions = self.processing.postprocess(normalized, inputs[STATE_KEY])
                 return {ACTIONS_KEY: actions}
             finally:
-                # A shutdown that timed out waiting for inference leaves engine
-                # release to the thread that still holds the lock.
                 if self._close_requested.is_set():
                     self._close_engine()
 
     def reset_run(self) -> None:
-        """Restart the noise stream once per client run; warmup takes the first draw."""
+        """Reset the CPU initial noise generator seed at the beginning of a client run."""
         with self._lock:
             if self._close_requested.is_set():
                 raise RuntimeError("Pi05Policy is closed")
             self._generator.manual_seed(self._seed)
 
     def _close_engine(self) -> None:
+        """Release underlying PhyAI engine resources once."""
         if not self._closed:
             self._engine.close()
             self._closed = True
 
     def close(self) -> None:
-        """Do not destroy CUDA resources underneath an active prediction."""
+        """Request engine shutdown, safely releasing GPU resources."""
         self._close_requested.set()
         if self._lock.acquire(blocking=False):
             try:

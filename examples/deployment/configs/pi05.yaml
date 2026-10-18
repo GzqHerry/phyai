@@ -1,20 +1,83 @@
-# Generic pi0.5 server defaults. Select a checkpoint-specific file with --config.
-task: ""
-endpoint: tcp://127.0.0.1:5555
-lease_timeout_s: 60.0  # Release a run after this long without client requests.
+# ==============================================================================
+# Generic PhyAI Pi0.5 Model Server Base Configuration
+# ==============================================================================
+# This configuration specifies default parameters for serve_pi05.py.
+# The server is 100% embodiment-agnostic: it loads a Pi0.5 checkpoint into GPU
+# memory, handles tokenization, normalization, flow-matching Euler denoising,
+# and relative-action restoration. Specific models extend or override these values
+# (e.g. pi05_tianji.yaml or pi05_agilex.yaml).
+#
+# Inspect merged settings:
+#   python -m examples.deployment.serve_pi05 --config examples/deployment/configs/pi05.yaml --print-config
+# ==============================================================================
 
+# Natural language task instruction describing the robot's manipulation goal.
+# Encoded by the tokenizer and passed to the vision-language backbone.
+task: ""
+
+# Network endpoint where the ZMQ REP socket binds to receive requests.
+# Default binds to loopback interface for secure local inter-process communication.
+endpoint: tcp://127.0.0.1:5555
+
+# Inactive client lease timeout in seconds.
+# If a connected robot client crashes or disconnects without calling "end",
+# the server automatically releases the active run reservation after this period.
+lease_timeout_s: 60.0
+
+# ------------------------------------------------------------------------------
+# PhyAI Model & Inference Engine Parameters
+# ------------------------------------------------------------------------------
 policy:
-  checkpoint: ???  # Required local export directory.
+  # Path to the exported Pi0.5 model checkpoint directory.
+  # Must contain config.json, safetensors weights, norm_stats.json, and tokenizer files.
+  # Required parameter; marked as MISSING (???) in base template.
+  checkpoint: ???
+
+  # Path to the kernel selection configuration YAML file.
   kernel_policy: examples/deployment/configs/pi05_bf16.yaml
-  seed: 42  # CPU noise stream, reset at the start of every client run.
-  num_inference_steps: null  # null keeps the checkpoint's Euler step count.
+
+  # Seed for the CPU diffusion initial noise generator.
+  # Reset on each new client run to ensure reproducible trajectory generation.
+  seed: 42
+
+  # Number of Euler flow-matching integration steps during inference.
+  # Set to an integer to override the checkpoint's default step count;
+  # set to null to use the step count specified in config.json.
+  num_inference_steps: null
+
+  # Enable CUDA Graph capture and replay for deterministic latency and minimal CPU overhead.
   use_cuda_graph: true
+
+  # Number of CPU runtime worker threads allocated for the PhyAI inference engine.
   num_threads: 16
 
+# ------------------------------------------------------------------------------
+# Observation Preprocessor Configuration
+# ------------------------------------------------------------------------------
 processor:
-  factory: null  # Built-in Pi05Processing; or module:factory / /path/file.py:factory.
-  options: {}  # Extra keyword arguments passed only to an external factory.
-  camera_names: null  # Model camera order; required for lerobot-style exports.
-  action_dim: null  # Required for lerobot-style exports.
-  metadata_file: null  # Metadata JSON relative to the checkpoint; null discovers it.
+  # Optional custom processor factory specification:
+  #   null: Uses default Pi05Processing wrapper.
+  #   "module:ClassName": Loads ClassName from installed Python module.
+  #   "path/file.py:ClassName": Loads ClassName from a standalone source file.
+  factory: null
+
+  # Extra keyword arguments passed exclusively to an external custom processor factory.
+  options: {}
+
+  # Ordered list of camera names matching the model's visual input conventions.
+  # Required for LeRobot-style checkpoints (where config does not specify camera order);
+  # for metadata-style checkpoints (RLinf), verified against deployment_metadata.json.
+  camera_names: null
+
+  # Dimensionality of the unpadded physical action vector.
+  # Required for LeRobot-style checkpoints; verified against metadata for RLinf checkpoints.
+  action_dim: null
+
+  # Relative filename of the deployment metadata JSON within the checkpoint directory.
+  # If null, automatically discovers deployment_metadata.json or the unique *_metadata.json.
+  metadata_file: null
+
+  # Image resizing backend:
+  #   "pil":   Uses Pillow bilinear interpolation (matches training dataset preprocessing).
+  #   "torch": Uses PyTorch interpolate operator.
   image_resize_backend: pil

@@ -1,8 +1,18 @@
-"""Shared robot-client configuration and entry point. No model imports.
+"""Shared robot-client configuration schemas and entry point coordinator.
 
-A robot entry point supplies its own robot config and an Embodiment builder;
-this module owns the RPC, control-loop and scheduling settings and runs the
-common phyai_robot.remote.run_remote lifecycle.
+Architecture & Scope:
+    This module provides the generic client infrastructure shared by all physical robot
+    entry points (e.g., Tianji, AgileX):
+    1. Configuration Data Classes:
+       - `RemoteConfig`: Connection parameters and timeout budgets for remote model RPC.
+       - `ControlConfig`: Real-time control loop frequency (control_hz) and sensor freshness
+         age thresholds (max_sample_age_s).
+       - `ScheduleConfig`: Trajectory chunk pacing parameters (action_hz, execution_horizon).
+    2. Lifecycle Execution (`main`):
+       - Parses layered configuration (dataclass defaults < bundled YAML < custom YAML < CLI).
+       - Instantiates `RemotePolicy` client and `Scheduler`.
+       - Invokes `phyai_robot.remote.run_remote` to execute the verified 11-step lifecycle.
+       - Catches KeyboardInterrupt (Ctrl-C) to exit cleanly without unhandled stack traces.
 """
 
 from __future__ import annotations
@@ -21,14 +31,22 @@ from .configuration import parse_config
 
 @dataclass
 class RemoteConfig:
-    """Server endpoint and per-request waits, independent of control rates."""
+    """Configuration parameters for connecting to the remote PhyAI policy server over ZMQ.
+
+    Attributes:
+        endpoint: ZMQ socket endpoint URL (default: loopback 'tcp://127.0.0.1:5555').
+        timeout_s: Synchronous timeout budget (in seconds) for standard RPC calls
+            (info, begin, predict, end).
+        warmup_timeout_s: Extended timeout budget (in seconds) for the initial warmup forward pass
+            (allows first-run JIT kernel compilation and CUDA graph capture).
+    """
 
     endpoint: str = "tcp://127.0.0.1:5555"
-    # Covers info, begin, predict and end. The first warmup may compile.
     timeout_s: float = 2.0
     warmup_timeout_s: float = 120.0
 
     def create(self) -> RemotePolicy:
+        """Instantiate a RemotePolicy client using these configured parameters."""
         return RemotePolicy(
             self.endpoint,
             timeout_s=self.timeout_s,
@@ -38,20 +56,30 @@ class RemoteConfig:
 
 @dataclass
 class ControlConfig:
-    """Control loop and sensor freshness; see phyai_robot.DeploymentOptions."""
+    """Actuation frequency and sensor data freshness parameters for RobotDeployment.
 
-    # Commands per second while a chunk executes; sets interpolation density.
+    Attributes:
+        control_hz: Physical actuator command dispatch frequency in Hz (e.g. 200.0 Hz = 5 ms tick).
+            Sets the linear interpolation density between discrete model trajectory targets.
+        max_sample_age_s: Maximum permitted reception age (in seconds) for any sensor sample.
+            If any sensor frame in an observation is older than this threshold, inference pauses
+            until fresh data arrives.
+        observation_timeout_s: Maximum duration (in seconds) to wait for all sensors to become
+            available and fresh before halting control and shutting down.
+        shutdown_timeout_s: Maximum duration (in seconds) to wait for a background inference thread
+            to finish after hardware stop has been issued.
+        max_control_lateness_s: Maximum tolerated delay past a scheduled send deadline (e.g. 10 ms).
+            Ticks delayed within this budget skip dropped frames; delays beyond this limit safely halt.
+    """
+
     control_hz: float = 200.0
-    # Every observation field must have been received within this age.
     max_sample_age_s: float = 0.5
-    # Wait for a complete, fresh snapshot before each prediction.
     observation_timeout_s: float = 10.0
-    # Wait for in-flight inference after the robot has been stopped.
     shutdown_timeout_s: float = 2.0
-    # Allowed lateness of a scheduled send; larger lateness stops the robot.
     max_control_lateness_s: float = 0.01
 
     def to_options(self) -> DeploymentOptions:
+        """Convert to phyai_robot.DeploymentOptions dataclass."""
         return DeploymentOptions(
             control_hz=self.control_hz,
             max_sample_age_s=self.max_sample_age_s,
@@ -63,17 +91,21 @@ class ControlConfig:
 
 @dataclass
 class ScheduleConfig:
-    """How predicted chunks are executed."""
+    """Action chunk trajectory pacing and execution horizon configuration.
 
-    # Only stop_and_refill exists today; RTC would be another strategy.
+    Attributes:
+        strategy: Scheduling algorithm identifier (default: "stop_and_refill").
+        action_hz: Rate (in Hz) at which predicted trajectory targets are consumed (e.g. 25.0 Hz).
+        execution_horizon: Number of leading targets executed per chunk before requesting a refill.
+            The chunk motion duration is computed as `execution_horizon / action_hz` seconds.
+    """
+
     strategy: str = "stop_and_refill"
-    # Model targets consumed per second; with execution_horizon this sets the
-    # duration of each executed chunk (horizon / action_hz seconds).
     action_hz: float = 25.0
-    # Number of leading targets executed from each prediction; null = all.
     execution_horizon: int | None = 20
 
     def create(self) -> StopAndRefill:
+        """Instantiate the configured trajectory Scheduler."""
         if self.strategy != "stop_and_refill":
             raise ValueError(f"unknown schedule.strategy: {self.strategy!r}")
         return StopAndRefill(
@@ -85,7 +117,14 @@ ConfigT = TypeVar("ConfigT")
 
 
 def validate_client(config: Any) -> None:
-    """Validate the shared sections and the robot's own section."""
+    """Perform cross-field semantic validation across remote, control, and robot settings.
+
+    Args:
+        config: Populated deployment configuration instance.
+
+    Raises:
+        ValueError: If settings violate physical or temporal constraints.
+    """
     if config.max_steps is not None and config.max_steps < 1:
         raise ValueError("max_steps must be positive or null")
     if not config.remote.endpoint.strip():
@@ -103,7 +142,17 @@ def main(
     default_config: Path,
     argv: Sequence[str] | None = None,
 ) -> None:
-    """Parse configuration, then run one robot session until Ctrl-C or max_steps."""
+    """Universal CLI entry point for physical robot deployment clients.
+
+    Parses command-line arguments, merges YAML defaults and overrides, executes
+    the remote deployment session, and handles Ctrl-C termination gracefully.
+
+    Args:
+        schema: Dataclass schema type defining client configuration structure.
+        build: Factory callable accepting (robot_config, policy_spec) and returning an Embodiment.
+        default_config: Path to bundled default YAML file for this robot.
+        argv: Optional command-line argument list (default: sys.argv[1:]).
+    """
     config: Any = parse_config(
         schema, default_config=default_config, argv=argv, validate=validate_client
     )

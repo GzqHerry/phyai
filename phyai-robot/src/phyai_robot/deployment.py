@@ -1,10 +1,28 @@
-"""One inference worker and one independently paced, single-step control loop.
+"""Robot deployment coordinator: background inference worker and real-time control loop.
 
-The worker takes a fresh snapshot and predicts whenever the scheduler asks for
-a new chunk. The control loop sends the scheduler's command for each tick at
-control_hz while the scheduler is active, and sends nothing while it is idle.
-The default StopAndRefill scheduler pauses motion during every inference; see
-scheduling.py for how a real-time chunking strategy fits the same loop.
+Architecture:
+    RobotDeployment coordinates two concurrent execution contexts:
+    1. Background Producer Thread (_produce):
+       - Monitors scheduler state (via `scheduler.wants_inference()`).
+       - Acquires fresh observation snapshots (under `_io_lock`).
+       - Translates snapshots via `adapter.to_request(obs, context)`.
+       - Calls synchronous model prediction via `policy.predict(request)`.
+         (Crucial: Prediction runs WITHOUT holding `_io_lock`, ensuring stalled GPU
+         inference never blocks hardware emergency shutdown).
+       - Validates predictions and submits them to `scheduler.add_chunk()`.
+    2. Real-Time Actuator Control Thread (_execute):
+       - Driven by a monotonic host clock at `options.control_hz` (e.g. 200 Hz).
+       - Queries `scheduler.action_at(tick_ns)` to retrieve interpolated targets.
+       - Enforces strict lateness bounds (`max_control_lateness_s`): skips dropped ticks
+         rather than emitting dangerous high-frequency catch-up command bursts.
+       - Dispatches commands to hardware via `robot.send_action(action)` (under `_io_lock`).
+
+Synchronization & Shutdown:
+    - An internal `threading.Condition` coordinates producer-consumer signaling.
+    - `_io_lock` serializes all hardware operations on `Robot` (get_observation, send_action, stop, close).
+    - Shutdown Sequence: When stopping, `robot.stop()` and `robot.close()` execute immediately
+      under `_io_lock`, preempting actuator motion even if a background model forward pass
+      is still running or blocked.
 """
 
 from __future__ import annotations
@@ -26,13 +44,41 @@ from .validation import freeze_values, validate_values
 
 @dataclass(frozen=True)
 class DeploymentOptions:
-    control_hz: float = 200.0  # Robot.send_action rate while commands are scheduled.
-    max_sample_age_s: float = 0.5  # Maximum local receive age of every snapshot field.
-    observation_timeout_s: float = 5.0  # Per-snapshot wait for complete, fresh sensors.
-    shutdown_timeout_s: float = 2.0  # Maximum wait for an in-flight prediction.
-    max_control_lateness_s: float = 0.01  # Allowed delay past a scheduled send.
+    """Configuration options governing control loop timing, timeouts, and freshness.
+
+    Attributes:
+        control_hz: Physical actuator command dispatch frequency in Hz (e.g., 200.0 Hz = 5 ms).
+            Defines the interpolation density between model trajectory targets.
+        max_sample_age_s: Maximum permitted local receive age in seconds for any sensor sample.
+            If any sensor frame in an observation is older than this limit, inference pauses
+            and waits for a fresh sample.
+        observation_timeout_s: Maximum duration in seconds to wait for a complete, fresh observation
+            before raising TimeoutError and shutting down hardware.
+        shutdown_timeout_s: Maximum duration in seconds to wait for a background inference thread
+            to terminate after hardware has been stopped and closed.
+        max_control_lateness_s: Maximum tolerated delay past a scheduled control tick deadline.
+            If host execution jitter or I/O contention exceeds this threshold (e.g. 10 ms),
+            the control loop halts safely rather than dispatching delayed commands.
+    """
+
+    control_hz: float = (
+        200.0  # Actuator send frequency in Hz during active trajectory execution.
+    )
+    max_sample_age_s: float = (
+        0.5  # Maximum sensor sample age at snapshot time in seconds.
+    )
+    observation_timeout_s: float = (
+        5.0  # Timeout for acquiring a complete fresh observation snapshot.
+    )
+    shutdown_timeout_s: float = (
+        2.0  # Grace period for background worker thread exit on shutdown.
+    )
+    max_control_lateness_s: float = (
+        0.01  # Maximum allowable delay past scheduled send deadline.
+    )
 
     def __post_init__(self) -> None:
+        """Validate that all options are positive, finite numbers."""
         for name in (
             "control_hz",
             "max_sample_age_s",
@@ -52,12 +98,11 @@ ResultT = TypeVar("ResultT")
 
 
 class RobotDeployment(Generic[RequestT, ResultT]):
-    """Run one observation/inference worker and one independent control loop.
+    """Coordinates physical robot I/O, trajectory scheduling, and asynchronous policy inference.
 
-    A Condition protects the scheduler and worker failures. Robot is not
-    required to be thread-safe: an I/O lock serializes worker reads, control
-    writes, shutdown and external stop requests. predict() never holds that
-    lock, so stopping hardware does not wait for a stalled model.
+    Single-Use Lifecycle:
+        Instances of RobotDeployment are strictly single-use. Once `run()` completes or raises,
+        hardware is closed and a new deployment instance must be constructed for subsequent runs.
     """
 
     def __init__(
@@ -69,37 +114,59 @@ class RobotDeployment(Generic[RequestT, ResultT]):
         scheduler: Scheduler,
         options: DeploymentOptions,
     ) -> None:
+        """Initialize the deployment coordinator.
+
+        Args:
+            robot: Robot hardware or composite abstraction.
+            policy: Model policy predictor (local engine or RemotePolicy over ZMQ).
+            adapter: Bridge converting between physical observations and model requests/actions.
+            scheduler: Trajectory scheduling strategy (e.g. StopAndRefill).
+            options: Deployment timing parameters and freshness thresholds.
+        """
         scheduler.bind(robot.action_schema)
         self.robot = robot
         self.policy = policy
         self.adapter = adapter
         self.scheduler = scheduler
         self.options = options
-        self._condition = threading.Condition()
-        self._io_lock: LockType = threading.Lock()
-        self._stop_event = threading.Event()
+
+        self._condition = (
+            threading.Condition()
+        )  # Coordinates signaling between worker and control loop.
+        self._io_lock: LockType = (
+            threading.Lock()
+        )  # Serializes all hardware operations on self.robot.
+        self._stop_event = threading.Event()  # Signals cancellation across all threads.
         self._worker_error: BaseException | None = None
         self._started = False
 
     def stop(self) -> None:
-        """Request shutdown; no new Robot I/O starts after this method returns.
+        """Request immediate shutdown. Guarantees no new Robot I/O begins after returning.
 
-        The run thread performs Robot.stop/close. Calls already inside bounded
-        Robot I/O finish first. In-flight inference is discarded on return.
+        Sets the cancellation event, wakes threads blocked on condition variables,
+        and waits for any already-executing Robot I/O call to complete.
         """
-        # Publish cancellation before waiting for the I/O barrier, so a worker
-        # finishing read() cannot start another send while stop() waits its turn.
         self._stop_event.set()
         with self._condition:
             self._condition.notify_all()
+        # Barrier: Wait for any currently executing get_observation or send_action to finish.
         with self._io_lock:
-            pass  # Wait for any already-started Robot call to finish.
+            pass
 
     def prepare_chunk(self, chunk: ActionChunk) -> ActionChunk:
-        """Validate a whole prediction and detach it from the adapter's buffers.
+        """Validate and freeze an entire predicted trajectory chunk.
 
-        A malformed target outside the executed prefix still indicates a broken
-        prediction, so every target is checked before the scheduler sees it.
+        Enforces that every action in the chunk conforms to the robot's ActionSchema and
+        contains only finite values. Freezes array buffers and checks scheduler capacity.
+
+        Args:
+            chunk: ActionChunk produced by adapter.to_actions().
+
+        Returns:
+            Validated ActionChunk containing immutable (frozen) command arrays.
+
+        Raises:
+            ValueError: If chunk is empty or any action violates schema / scheduler constraints.
         """
         if not isinstance(chunk, ActionChunk) or not chunk.actions:
             raise ValueError("adapter must return a nonempty ActionChunk")
@@ -111,8 +178,10 @@ class RobotDeployment(Generic[RequestT, ResultT]):
         return prepared
 
     def _produce(self) -> None:
+        """Background worker loop: acquire observations, query model, and submit chunks."""
         try:
             while True:
+                # Wait until the scheduler indicates it is ready for a new prediction.
                 with self._condition:
                     self._condition.wait_for(
                         lambda: self._stop_event.is_set()
@@ -120,7 +189,8 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                     )
                     if self._stop_event.is_set():
                         return
-                # Never relax the age threshold: retry until every field is fresh.
+
+                # Acquire a fresh sensor observation snapshot under the I/O lock.
                 observation = wait_for_observation(
                     self.robot,
                     timeout_s=self.options.observation_timeout_s,
@@ -130,37 +200,56 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                 )
                 if observation is None:
                     return
+
                 with self._condition:
                     context = self.scheduler.begin_inference(time.monotonic_ns())
+
+                # Prepare model request via adapter.
                 request = self.adapter.to_request(observation, context)
                 if self._stop_event.is_set():
                     return
+
+                # Execute model inference forward pass WITHOUT holding _io_lock.
+                # This ensures long or stalled inference never blocks hardware stop/close.
                 result = self.policy.predict(request)
                 if self._stop_event.is_set():
                     return
+
+                # Convert result to physical actions and validate complete chunk.
                 chunk = self.prepare_chunk(self.adapter.to_actions(result, observation))
+
+                # Submit the new chunk to the scheduler under the condition lock.
                 with self._condition:
                     if self._stop_event.is_set():
                         return
                     self.scheduler.add_chunk(chunk, context, time.monotonic_ns())
                     self._condition.notify_all()
-        except BaseException as error:  # noqa: BLE001 - forward failures across threads
+        except BaseException as error:  # noqa: BLE001 - forward background exceptions to main thread
             with self._condition:
                 self._worker_error = error
                 self._condition.notify_all()
             self.stop()
 
     def _raise_worker_error(self) -> None:
+        """Re-raise background worker exceptions in the main thread."""
         with self._condition:
             if self._worker_error is not None:
                 raise self._worker_error
 
     def _execute(self, remaining_steps: int | None) -> int:
-        """Send scheduled commands on a fresh clock until the scheduler idles.
+        """Execute control ticks at control_hz until the active chunk completes or lateness occurs.
 
-        Tolerated lateness skips old ticks instead of replaying them in a
-        catch-up burst; larger lateness stops execution. Returns the number of
-        commands actually sent.
+        Enforces temporal determinism:
+        - Ticks are scheduled strictly on a monotonic clock: deadline = start + tick * period.
+        - If host jitter causes a delay within max_control_lateness_s, missed intermediate ticks
+          are skipped and the latest due target is emitted, avoiding high-frequency command bursts.
+        - If lateness exceeds max_control_lateness_s, a detailed TimeoutError is raised.
+
+        Args:
+            remaining_steps: Maximum sends permitted before returning (None = no limit).
+
+        Returns:
+            Total count of physical commands successfully dispatched during this execution block.
         """
         period_ns = 1e9 / self.options.control_hz
         max_lateness_ns = self.options.max_control_lateness_s * 1e9
@@ -168,32 +257,39 @@ class RobotDeployment(Generic[RequestT, ResultT]):
         tick = 0
         sent = 0
         previous_send_ns = 0
+
         while True:
             scheduled_tick = tick
             deadline_ns = started_at_ns + round(tick * period_ns)
+
+            # Sleep until scheduled tick deadline, aborting early if stop was signaled.
             if self._stop_event.wait(max(0, (deadline_ns - time.monotonic_ns()) / 1e9)):
                 return sent
             woke_at_ns = time.monotonic_ns()
+
             with self._io_lock:
                 if self._stop_event.is_set():
                     return sent
                 locked_at_ns = time.monotonic_ns()
-                # Keep the original deadline for the lateness check. Moving it
-                # forward first would hide stalls larger than the configured limit.
-                # Within that limit, select the latest due tick.
+
+                # Determine the latest due tick based on current monotonic clock time.
                 tick = max(tick, math.floor((locked_at_ns - started_at_ns) / period_ns))
+
                 with self._condition:
                     action = self.scheduler.action_at(
                         started_at_ns + round(tick * period_ns)
                     )
-                    # The worker waits on this condition; wake it as soon as
-                    # the scheduler wants a prediction, idle or not.
+                    # Notify producer worker thread as soon as the scheduler needs inference.
                     if action is None or self.scheduler.wants_inference():
                         self._condition.notify_all()
                     if action is None:
+                        # Chunk has finished executing; return to idle to wait for refill.
                         return sent
+
                 now_ns = time.monotonic_ns()
                 lateness_ns = now_ns - deadline_ns
+
+                # Enforce control lateness limit to safeguard hardware against timing stalls.
                 if lateness_ns > max_lateness_ns:
                     raise TimeoutError(
                         "control deadline exceeded: "
@@ -206,35 +302,54 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                         f"prepare_ms={(now_ns - locked_at_ns) / 1e6:.6f}, "
                         f"previous_send_ms={previous_send_ns / 1e6:.6f}"
                     )
+
+                # Transmit the physical command to robot actuators.
                 self.robot.send_action(action)
                 previous_send_ns = time.monotonic_ns() - now_ns
+
             sent += 1
             if remaining_steps is not None and sent >= remaining_steps:
                 return sent
-            # Preparation can also cross a tick boundary. Do not replay that tick
-            # immediately after this send; keep the next deadline on this clock.
+
+            # Advance to the next scheduled tick on the original chunk clock.
             tick = max(tick + 1, math.floor((now_ns - started_at_ns) / period_ns) + 1)
 
     def run(self, *, max_steps: int | None = None) -> None:
-        """Connect, execute, and always stop/close; max_steps counts actual sends."""
+        """Connect the robot, start background worker, and run the real-time control loop.
+
+        Guarantees that hardware is safely stopped and closed upon exit or exception.
+
+        Args:
+            max_steps: Optional maximum number of commands to dispatch before stopping.
+                None runs indefinitely until interrupted with Ctrl-C or stopped externally.
+
+        Raises:
+            RuntimeError: If called more than once on the same deployment instance.
+            BaseExceptionGroup: If deployment runtime errors or cleanup failures occur.
+        """
         if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
             raise ValueError("max_steps must be a positive integer")
         if self._started:
             raise RuntimeError("deployment instances are single-use")
         self._started = True
+
         worker: threading.Thread | None = None
         errors: list[BaseException] = []
+
         try:
             with self._io_lock:
                 if not self._stop_event.is_set():
                     self.robot.connect()
+
             if not self._stop_event.is_set():
                 worker = threading.Thread(
                     target=self._produce, name="phyai-policy", daemon=True
                 )
                 worker.start()
+
             sent = 0
             while not self._stop_event.is_set():
+                # Wait until the scheduler becomes active with executable actions.
                 with self._condition:
                     self._condition.wait_for(
                         lambda: self._stop_event.is_set() or self.scheduler.is_active()
@@ -242,22 +357,27 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                 self._raise_worker_error()
                 if self._stop_event.is_set():
                     break
+
+                # Execute actions from the active chunk.
                 sent += self._execute(None if max_steps is None else max_steps - sent)
                 if max_steps is not None and sent >= max_steps:
                     break
+
             self._raise_worker_error()
-        except BaseException as error:  # noqa: BLE001 - preserve errors through cleanup
+        except BaseException as error:  # noqa: BLE001 - capture all errors to ensure cleanup
             errors.append(error)
         finally:
             self.stop()
-            # Stop hardware before waiting for potentially blocked prediction.
-            # The I/O lock also excludes the producer's bounded observation read.
+            # Hardware Safety Guarantee: Stop and close physical actuators first
+            # before waiting on a potentially blocked background inference call.
             with self._io_lock:
                 for cleanup in (self.robot.stop, self.robot.close):
                     try:
                         cleanup()
-                    except BaseException as error:  # noqa: BLE001 - preserve cleanup failures
+                    except BaseException as error:  # noqa: BLE001
                         errors.append(error)
+
+            # Join background worker thread up to shutdown_timeout_s budget.
             if worker is not None:
                 worker.join(self.options.shutdown_timeout_s)
                 if worker.is_alive():
@@ -267,6 +387,7 @@ class RobotDeployment(Generic[RequestT, ResultT]):
                             "do not destroy its resources until predict() returns"
                         )
                     )
+
         if len(errors) == 1:
             raise errors[0]
         if errors:

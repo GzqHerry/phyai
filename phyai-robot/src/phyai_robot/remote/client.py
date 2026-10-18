@@ -1,9 +1,26 @@
-"""The robot-side lifecycle for a resident model server.
+"""The standard robot-side deployment lifecycle against a resident model server.
 
-Every robot client follows the same order: read the model contract, build the
-robot and its adapter without I/O, reserve a run, connect, discard one warmup,
-check sensors again, enable device commands, and run the control loop. Cleanup
-always stops and closes the robot before releasing the model run.
+Lifecycle Protocol & Invariants:
+    Every robot client follows an identical deterministic 11-step execution sequence:
+    1. Query Model Spec: `spec = policy.info()` retrieves server schemas and metadata
+       (e.g. required camera image size, input state dimensionality).
+    2. Zero-I/O Embodiment Construction: `embodiment = build(spec)` constructs the
+       CompositeRobot and VectorAdapter without opening any ROS nodes or physical sockets.
+    3. Handshake Schema Verification: Verifies that `adapter.request_schema` matches the
+       server's declared `spec.inputs` contract before reserving the server or connecting.
+    4. Register Reverse Cleanup: Registers `policy.close` and `robot.close` in an ExitStack.
+       Guarantee: Hardware is stopped and closed BEFORE the model run reservation is freed.
+    5. Reserve Run: `policy.begin_run()` reserves exclusive server access and resets RNG noise.
+    6. Connect Hardware: `robot.connect()` establishes native ROS 2 or transport sessions.
+    7. Initial Snapshot: `wait_for_observation()` polls until all sensors report fresh samples.
+    8. Warmup Execution: `policy.warmup(request)` executes the first forward pass, and the
+       returned action chunk is validated in full and discarded. (Surfaces compilation or
+       dimension errors before physical motion is enabled).
+    9. Re-verify Freshness: Because warmup may take several seconds, sensor freshness is
+       re-audited before actuation.
+    10. Actuator Enablement: `embodiment.activate()` enables controller user command routing
+        (e.g., Tianji calling `set_ready` -> `set_mode` -> `set_input(3)`).
+    11. Control Loop Execution: `deployment.run(max_steps=max_steps)` starts the real-time loop.
 """
 
 from __future__ import annotations
@@ -22,11 +39,15 @@ from ..deployment import RobotDeployment, DeploymentOptions
 
 
 class Embodiment(NamedTuple):
-    """An unconnected robot, its model adapter, and an optional enable step.
+    """Container holding an assembled robot, its policy adapter, and an activation hook.
 
-    adapter.request_schema must equal the server's input schema. activate runs
-    once after warmup and a fresh observation, immediately before control; use
-    it to switch a controller to external commands. Robot.stop must undo it.
+    Attributes:
+        robot: Connected or unconnected Robot instance.
+        adapter: PolicyAdapter converting physical Observations to model request dictionaries.
+            Its `request_schema` must match the model server's `spec.inputs`.
+        activate: Optional zero-argument callable executed after successful warmup and freshness
+            verification, immediately before the control loop starts. Used to command controller
+            services (e.g. enabling user joint multiplexing). Stopping the robot must undo this.
     """
 
     robot: Robot
@@ -43,25 +64,45 @@ def run_remote(
     max_steps: int | None = None,
     report: Callable[[str], None] = lambda message: None,
 ) -> None:
-    """Run one robot session against a resident model server.
+    """Execute a complete robot deployment session against a remote policy server.
 
-    build receives the server's spec (for example its image size) and must not
-    perform I/O. The warmup result is converted and validated like any other
-    chunk, so adapter, horizon and schema errors surface before activation.
+    Args:
+        policy: Connected RemotePolicy instance.
+        build: Factory callable accepting PolicySpec and returning an Embodiment.
+            Must not perform physical I/O.
+        scheduler: Action chunk scheduling strategy (e.g. StopAndRefill).
+        options: Deployment options specifying control frequency and freshness bounds.
+        max_steps: Optional maximum number of commands to dispatch before stopping.
+        report: Callback for logging lifecycle milestones (e.g. print).
+
+    Raises:
+        ValueError: If robot adapter schemas do not match server input requirements.
+        TimeoutError: If sensor snapshots or RPC calls exceed timeout thresholds.
     """
     with ExitStack() as resources:
-        # ExitStack unwinds in reverse: stop/close the robot, then end the run.
+        # ExitStack unwinds in reverse registration order:
+        # 1. robot.close() halts physical actuators and closes hardware sessions.
+        # 2. policy.close() ends the remote server run reservation.
         resources.callback(policy.close)
+
+        # Step 1: Query model server specifications (no run reservation).
         spec = policy.info()
+
+        # Step 2: Build robot and adapter based on model image_size and horizons.
         embodiment = build(spec)
         robot, adapter = embodiment.robot, embodiment.adapter
+
+        # Step 3: Verify physical contract parity between adapter output and model inputs.
         expected = schema_to_json(spec.inputs)
         actual = schema_to_json(getattr(adapter, "request_schema", {}))
         if actual != expected:
             raise ValueError(
                 f"robot adapter produces {actual}, but the model expects {expected}"
             )
+
+        # Register hardware cleanup before opening hardware connections.
         resources.callback(robot.close)
+
         deployment = RobotDeployment(
             robot=robot,
             policy=policy,
@@ -69,6 +110,8 @@ def run_remote(
             scheduler=scheduler,
             options=options,
         )
+
+        # Step 5 & 6: Reserve model run and connect robot transports.
         policy.begin_run()
         robot.connect()
 
@@ -79,7 +122,10 @@ def run_remote(
                 max_age_s=options.max_sample_age_s,
             )
 
+        # Step 7: Wait for all sensors to deliver complete, fresh data frames.
         observation = fresh_observation()
+
+        # Step 8: Execute first warmup inference forward pass and discard output.
         started = time.monotonic()
         result = policy.warmup(adapter.to_request(observation, InferenceContext()))
         warmup = deployment.prepare_chunk(adapter.to_actions(result, observation))
@@ -87,9 +133,15 @@ def run_remote(
             f"Warmup took {time.monotonic() - started:.3f}s; "
             f"discarded {len(warmup.actions)} targets"
         )
-        # Warmup may outlive the samples it used; never enable on stale sensors.
+
+        # Step 9: Re-verify sensor freshness after warmup delay.
         fresh_observation()
+
+        # Step 10: Enable controller actuator command routing.
         if embodiment.activate is not None:
             embodiment.activate()
+
         report("Robot commands enabled; Ctrl-C stops")
+
+        # Step 11: Execute the real-time control loop.
         deployment.run(max_steps=max_steps)

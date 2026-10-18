@@ -1,17 +1,22 @@
 """Tianji (Marvin Pro) robot: ROS bindings, model adapter and controller enable.
 
-Data flow: ROS message -> decoder -> cached Sample -> Observation -> adapter ->
-model state/images; model action rows -> adapter -> complete Action -> one
-publication per arm and gripper. RobotDeployment owns timing and interpolation.
-
-Cameras can come from an H.264 preview mosaic or individual NV12 topics.
-The configured tile size can reproduce recording geometry before letterboxing
-images to the model input size.
-
-Before commands are routed, activate() calls set_ready, set_mode, optional
-set_vel_ratio and finally set_input(3) (User/Custom joint input). Stopping the
-robot calls set_input(0). It never homes the arms, restores a previous mode or
-sends a gripper target; it is not an emergency stop.
+Architecture & Data Flow:
+    1. Sensor Ingestion:
+       - Cameras: The default `camera_source="mosaic"` subscribes to the compressed
+         H.264 preview stream (/quad_tile/compressed_undistorted) from the multi-camera
+         Argus container. A single worker thread decodes the access units via PyAV and
+         splits the 2x2 grid into three logical camera views with synchronized timestamps.
+       - Joint & Gripper Feedback: Joint feedback (/tj/info/joint_feedback) provides
+         14-DoF arm positions, and gripper feedback topics (/info/gripper_feedback_L/R)
+         provide motor position readings.
+    2. Model Mapping (VectorAdapter):
+       - Assembles the 16-DoF state vector: [L_j0..L_j6, L_grip, R_j0..R_j6, R_grip].
+       - Normalizes gripper feedback from motor radians [0.0, 1.6] to [0.0, 1.0].
+    3. Controller Activation & Safety (TianjiController):
+       - Activation sequence: set_ready -> set_mode(3, impedance) -> optional set_vel_ratio
+         -> set_input(3, user channel takeover).
+       - Stop sequence: On halt or error, calls set_input(0) to safely disengage the user
+         channel without disabling motors, homing the arms, or dropping held payloads.
 """
 
 from __future__ import annotations
@@ -78,34 +83,45 @@ def _sides(**topics: str) -> Any:
 
 @dataclass
 class TianjiConfig:
-    """Tianji ROS connection, controller and calibration settings.
+    """Tianji ROS connection, controller service, and calibration configuration.
 
-    Topic maps are keyed by "left"/"right" (or by camera field). QoS values are
-    names accepted by phyai_robot.backends.ros2.resolve_qos and must be
-    compatible with the actual publishers/subscribers.
+    Attributes:
+        domain_id: ROS 2 domain ID (must match Apex controller stack, default: 24).
+        node_name: Base name for ROS 2 nodes instantiated by this client.
+        mode: Controller operating mode (1: Joint Position, 3: Joint Impedance).
+        velocity_ratio: Controller velocity scaling percentage [1, 100] (null leaves unchanged).
+        service_timeout_s: Synchronous timeout budget for ROS 2 controller service calls.
+        io_timeout_s: Single-step command publication timeout.
+        gripper_limits_rad: Gripper motor stroke calibration [lower, upper] in radians.
+        camera_source: "mosaic" for H.264 compressed stream (~30 fps), "raw" for NV12 topics.
+        camera_size: Optional [height, width] stretch target before square letterboxing.
+        camera_resize_hw: Alias for camera_size for backward compatibility.
+        mosaic_topic: ROS 2 topic name for the compressed H.264 multi-camera mosaic.
+        mosaic_grid: [rows, columns] grid shape of the mosaic image.
+        mosaic_tiles: Mapping from camera field names to [row, column] cell indices in mosaic.
+        mosaic_max_rate_hz: Maximum RGB conversion rate in Hz for mosaic decoder.
+        camera_topics: Mapping of camera fields to raw NV12 topics (used when camera_source="raw").
+        model_cameras: Mapping from model camera keys to robot observation fields.
+        joint_feedback_topic: Dual arm Jointfeedback topic.
+        gripper_feedback_topics: Per-side gripper motor Float32MultiArray topics.
+        eef_topics: Optional end-effector PoseStamped topics.
+        wrench_topics: Optional wrist WrenchStamped topics.
+        joint_command_topics: Per-side JointcmdArm command topics.
+        gripper_command_topics: Per-side Float32 gripper command topics.
+        service_namespace: Controller service topic namespace (default: '/tj/control').
+        qos: Mapping of topic categories to QoS profile aliases.
     """
 
-    # ROS domain of the Apex stack; null uses ROS_DOMAIN_ID from the environment.
     domain_id: int | None = None
     node_name: str = "phyai_tianji"
-    # 1: joint position; 3: joint impedance. Mode 2 does not accept joint targets.
     mode: int = MODE_JOINT_IMPEDANCE
-    # Controller velocity percentage [1, 100]; null leaves it unchanged.
     velocity_ratio: int | None = None
-    # End-to-end budget of each controller service call, including stop.
     service_timeout_s: float = 3.0
-    # Budget for publishing one command.
     io_timeout_s: float = 0.1
-    # Gripper feedback [lower, upper] in motor radians; maps model state to [0, 1].
     gripper_limits_rad: list[float] = field(default_factory=lambda: [0.0, 1.6])
-    # "mosaic": decode the H.264 preview mosaic; "raw": per-camera NV12 images.
     camera_source: str = "mosaic"
-    # Each camera image is resized to this [height, width] before letterboxing,
-    # matching training geometry when specified; null keeps its aspect ratio.
     camera_size: list[int] | None = None
-    # Alias for camera_size; accepted for compatibility with converted model configs.
     camera_resize_hw: list[int] | None = None
-    # H.264 mosaic of the undistorted cameras and each field's [row, column].
     mosaic_topic: str = "/quad_tile/compressed_undistorted"
     mosaic_grid: list[int] = field(default_factory=lambda: [2, 2])
     mosaic_tiles: dict[str, list[int]] = field(
@@ -115,9 +131,7 @@ class TianjiConfig:
             "right_wrist_camera": [1, 1],
         }
     )
-    # Converted mosaic frames per second; every access unit is still decoded.
     mosaic_max_rate_hz: float = 15.0
-    # Observation field -> undistorted NV12 topic, used by camera_source: raw.
     camera_topics: dict[str, str] = field(
         default_factory=lambda: {
             "head_camera": "/camera/left_eye/image_nv12_undistorted",
@@ -125,7 +139,6 @@ class TianjiConfig:
             "right_wrist_camera": "/camera/right_wrist/image_nv12_undistorted",
         }
     )
-    # Model camera name -> observation field.
     model_cameras: dict[str, str] = field(
         default_factory=lambda: {
             "head_left": "head_camera",
@@ -137,7 +150,6 @@ class TianjiConfig:
     gripper_feedback_topics: dict[str, str] = _sides(
         left="/info/gripper_feedback_L", right="/info/gripper_feedback_R"
     )
-    # Optional extra observations; empty maps subscribe to nothing.
     eef_topics: dict[str, str] = field(default_factory=dict)
     wrench_topics: dict[str, str] = field(default_factory=dict)
     joint_command_topics: dict[str, str] = _sides(
@@ -177,8 +189,11 @@ class TianjiConfig:
             raise ValueError("robot.gripper_limits_rad must be finite and increasing")
         if self.camera_source not in CAMERA_SOURCES:
             raise ValueError(f"robot.camera_source must be one of {CAMERA_SOURCES}")
+
+        # Support camera_resize_hw as an alias for camera_size.
         if self.camera_size is None and self.camera_resize_hw is not None:
             self.camera_size = self.camera_resize_hw
+
         if self.camera_size is not None and (
             len(self.camera_size) != 2 or min(self.camera_size) < 1
         ):
@@ -187,6 +202,7 @@ class TianjiConfig:
             len(self.camera_resize_hw) != 2 or min(self.camera_resize_hw) < 1
         ):
             raise ValueError("robot.camera_resize_hw must be [height, width] or null")
+
         if len(self.mosaic_grid) != 2 or min(self.mosaic_grid) < 1:
             raise ValueError("robot.mosaic_grid must be [rows, columns]")
         rows, columns = self.mosaic_grid
@@ -226,14 +242,14 @@ class TianjiConfig:
 
 
 def camera_fields(config: TianjiConfig) -> list[str]:
-    """Observation fields provided by the selected camera source."""
+    """Return observation fields provided by the selected camera source."""
     if config.camera_source == "mosaic":
         return list(config.mosaic_tiles)
     return list(config.camera_topics)
 
 
 def camera_transform(config: TianjiConfig, image_size: int):
-    """Reshape one full camera image like the recorded training tiles."""
+    """Factory creating an image transform pipeline matching training geometry."""
     size = config.camera_size
 
     def transform(image: np.ndarray) -> np.ndarray:
@@ -261,7 +277,7 @@ ACTION_SCHEMA = {
 
 
 def observation_schema(config: TianjiConfig, image_size: int) -> dict[str, FeatureSpec]:
-    """Camera fields use the model's square image size; decoders resize to it."""
+    """Construct ObservationSchema based on active camera and sensor topic configuration."""
     schema = {
         key: FeatureSpec((image_size, image_size, 3), "uint8")
         for key in camera_fields(config)
@@ -279,11 +295,7 @@ def observation_schema(config: TianjiConfig, image_size: int) -> dict[str, Featu
 
 
 def make_adapter(config: TianjiConfig, observations: dict[str, FeatureSpec]):
-    """Dataset layout: [left joints 0:7, left gripper, right joints, right gripper].
-
-    Gripper state is feedback position mapped from gripper_limits_rad to [0, 1],
-    unclipped; gripper commands are clamped to [0, 1].
-    """
+    """Construct a VectorAdapter binding Tianji physical joints and calibrated grippers."""
     limits = tuple(config.gripper_limits_rad)
     return VectorAdapter(
         observation_schema=observations,
@@ -309,7 +321,7 @@ def make_adapter(config: TianjiConfig, observations: dict[str, FeatureSpec]):
 
 
 def check_gripper_range(action: Action) -> None:
-    """Reject normalized gripper targets outside [0, 1] before publishing."""
+    """Action guard: Reject normalized gripper commands outside [0.0, 1.0]."""
     for side in SIDES:
         value = float(action[f"gripper_{side}"][0])
         if not 0.0 <= value <= 1.0:
@@ -317,11 +329,9 @@ def check_gripper_range(action: Action) -> None:
 
 
 class TianjiController:
-    """Route the joint mux to User/Custom input and back, via controller services.
+    """Manages Marvin Pro controller state transitions via ROS 2 services.
 
-    Service calls run on the command backend's worker, so no second ROS context
-    is needed. Stop requests idle input only after activate() has started, so
-    connecting and closing without enabling never changes controller state.
+    Services run on the command backend's dedicated worker thread via backend.call_service().
     """
 
     def __init__(self, config: TianjiConfig) -> None:
@@ -345,10 +355,9 @@ class TianjiController:
         )
 
     def activate(self) -> None:
-        """Ready, mode, optional velocity, then input=3; not a transaction."""
+        """Execute controller startup sequence: ready -> mode -> vel_ratio -> input=3."""
         assert self.backend is not None
         config = self._config
-        # Allow stop to request idle even if a later call fails.
         self._enabled = True
         self._call(self.backend, "set_ready", None)
         self._call(self.backend, "set_mode", config.mode)
@@ -357,12 +366,13 @@ class TianjiController:
         self._call(self.backend, "set_input", INPUT_USER)
 
     def on_stop(self, backend: Ros2Backend) -> None:
+        """Safety callback: Switch input mux back to idle (0) upon stop or shutdown."""
         if self._enabled:
             self._call(backend, "set_input", INPUT_IDLE)
 
 
 def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
-    """Compose the robot, adapter and controller without any ROS I/O."""
+    """Construct Tianji CompositeRobot, VectorAdapter, and controller activation hook."""
     from std_msgs.msg import Float32, Float32MultiArray
     from marvin_msgs.msg import JointcmdArm, Jointfeedback
     from sensor_msgs.msg import Image, CompressedImage
@@ -371,6 +381,8 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
     image_size = int(spec.metadata["image_size"])
     qos = config.qos
     ros = dict(domain_id=config.domain_id, io_timeout_s=config.io_timeout_s)
+
+    # Decode both left and right arm feedback from a single Jointfeedback topic.
     observations: dict[str | tuple[str, ...], RosObservation] = {
         ("joint_position_left", "joint_position_right"): RosObservation(
             config.joint_feedback_topic,
@@ -391,6 +403,7 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
         observations[f"wrench_{side}"] = RosObservation(
             topic, WrenchStamped, decode_wrench, qos["wrench"]
         )
+
     actions: dict[str | tuple[str, ...], RosCommand] = {}
     for side in SIDES:
         actions[f"joint_position_{side}"] = RosCommand(
@@ -406,19 +419,20 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
             partial(encode_gripper, message_type=Float32),
             qos["gripper_command"],
         )
+
     controller = TianjiController(config)
     controller.backend = Ros2Backend(
         observations=observations,
         actions=actions,
         on_stop=controller.on_stop,
         node_name=config.node_name,
-        # Stop makes one set_input(0) call bounded by service_timeout_s.
         stop_timeout_s=config.service_timeout_s + SERVICE_POLL_MARGIN_S,
         **ros,
     )
+
     transform = camera_transform(config, image_size)
     if config.camera_source == "mosaic":
-        # One worker decodes the whole stream; the tiles share a frame and time.
+        # Decodes the multi-camera H.264 stream on a dedicated worker with frame_num protection.
         mosaic = MosaicDecoder(
             tiles={key: tuple(tile) for key, tile in config.mosaic_tiles.items()},
             grid=tuple(config.mosaic_grid),
@@ -438,6 +452,7 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
             )
         ]
     else:
+        # Fallback: Allocate one worker per uncompressed NV12 camera topic.
         cameras = image_backends(
             config.camera_topics,
             message_type=Image,
@@ -446,6 +461,7 @@ def build(config: TianjiConfig, spec: PolicySpec) -> Embodiment:
             qos=qos["camera"],
             **ros,
         )
+
     schema = observation_schema(config, image_size)
     robot = CompositeRobot(
         observation_schema=schema,

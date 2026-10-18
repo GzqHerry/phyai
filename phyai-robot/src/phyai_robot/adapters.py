@@ -1,12 +1,25 @@
-"""A robot-level adapter between named robot fields and a vector model contract.
+"""Robot-level adapter bridging physical named robot schemas to vector model contracts.
 
-Most VLA checkpoints consume ordered camera images plus one state vector and
-predict a matrix of action vectors. VectorAdapter declares, per robot, which
-fields fill those vectors and in which order, so model servers never need to
-know an embodiment's field names, units or calibration.
+Most Vision-Language-Action (VLA) models (such as Pi0, Pi0.5, OpenVLA, Octo) share a
+canonical input/output tensor structure:
+- Inputs:
+    - Multiple ordered RGB camera images: passed as individual tensors under
+      names 'image.<camera_name>' (e.g. 'image.head_left', 'image.left_wrist').
+    - One concatenated proprioceptive state vector: passed under the key 'state'
+      (shape: (state_dim,), dtype: float32).
+- Outputs:
+    - One 2D matrix of action trajectories: passed under the key 'actions'
+      (shape: (horizon, action_dim), dtype: float32 or float64).
 
-Model inputs are named arrays: "image.<camera>" for each RGB image and "state"
-for the state vector. Model outputs contain "actions" with shape (H, D).
+VectorAdapter serves as the physical robot's ambassador to this vector contract:
+- It configures which physical sensor fields fill which slots of the state vector,
+  along with optional linear calibration limits (e.g. mapping raw gripper encoder
+  travel [0.0, 1.6] rad to normalized range [0.0, 1.0]).
+- It decomposes output rows of the action matrix back into physical robot action
+  fields (e.g. splitting columns into arm joint positions and gripper commands),
+  applying optional safety validity clamping (clip).
+- Decoupling guarantee: By encapsulating embodiment mapping in VectorAdapter, the
+  model server remains completely agnostic of the physical robot (zero robot imports).
 """
 
 from __future__ import annotations
@@ -24,37 +37,55 @@ from .types import Action, Schema, ActionChunk, FeatureSpec, Observation
 from .scheduling import InferenceContext
 from .validation import validate_schema
 
-IMAGE_PREFIX = "image."
-STATE_KEY = "state"
-ACTIONS_KEY = "actions"
+# Reserved dictionary keys for model RPC array payloads.
+IMAGE_PREFIX = "image."  # Prefix for camera image inputs (e.g. "image.front").
+STATE_KEY = "state"  # Key for the concatenated 1D state vector.
+ACTIONS_KEY = "actions"  # Key for the 2D predicted action trajectory matrix (horizon, action_dim).
 
 
 @dataclass(frozen=True)
 class StateSlot:
-    """Append components of one observation field to the model state vector.
+    """Configures extraction of an observation field into the model state vector.
 
-    limits=(low, high) maps raw values linearly so low -> 0 and high -> 1,
-    without clipping, e.g. a gripper position calibrated to its travel range.
+    Attributes:
+        field: Name of the physical observation field in ObservationSchema.
+        index: Optional tuple of integer indices for selecting a subset of components
+            from a 1D vector field (e.g. index=(0,) to select only the position element
+            from a 5-element gripper feedback vector). None selects all components.
+        limits: Optional linear normalization limits (low, high). When provided, raw values
+            are linearly mapped: normalized = (raw - low) / (high - low).
+            Notice: No clipping is performed here, preserving small out-of-range readings
+            (such as mechanical hardstop offsets) present in physical training data.
     """
 
     field: str
-    index: tuple[int, ...] | None = None  # Components of a 1-D field; None = all.
-    limits: tuple[float, float] | None = None
+    index: tuple[int, ...] | None = (
+        None  # Component indices within the field (None = all).
+    )
+    limits: tuple[float, float] | None = (
+        None  # (low, high) calibration limits for [0, 1] normalization.
+    )
 
 
 @dataclass(frozen=True)
 class CommandSlot:
-    """Fill one complete action field from the next model action components.
+    """Configures unpacking of model action columns into a physical actuator command field.
 
-    The width is the field's size. clip=(low, high) clamps model values before
-    casting to the field's dtype; it is a validity range, not a safety limit.
+    Attributes:
+        field: Name of the physical actuator command field in ActionSchema.
+        clip: Optional validity range (low, high) applied before casting to the target dtype.
+            For instance, clip=(0.0, 1.0) clamps normalized gripper targets to [0, 1].
+            This represents valid domain boundary enforcement, not collision prevention.
     """
 
     field: str
-    clip: tuple[float, float] | None = None
+    clip: tuple[float, float] | None = (
+        None  # (min, max) clipping limits applied to predictions.
+    )
 
 
 def _check_range(name: str, value: tuple[float, float] | None) -> None:
+    """Validate that a range tuple consists of two strictly increasing finite floats."""
     if value is None:
         return
     if len(value) != 2 or not all(math.isfinite(v) for v in value):
@@ -64,11 +95,16 @@ def _check_range(name: str, value: tuple[float, float] | None) -> None:
 
 
 class VectorAdapter:
-    """PolicyAdapter from a robot's schemas to named model input/output arrays.
+    """Concrete PolicyAdapter mapping physical robot schemas to/from VLA vector contracts.
 
-    Images are passed through without copying, so camera fields must already
-    use the model's RGB uint8 image size. State is assembled in float64 and
-    sent as float32. Every predicted row becomes one complete robot Action.
+    Invariants:
+    1. Zero Image Copies: Image arrays are passed directly from Observation into the request
+       mapping without re-allocation. Camera fields must already match the model's required
+       HWC RGB uint8 dimensions (handled upstream by camera decoders or letterbox steps).
+    2. Precision Preservation: State extraction accumulates in float64 arithmetic to avoid
+       numerical loss during linear affine scaling, then converts to float32 for the model.
+    3. Trajectory Unpacking: Model predictions shaped (horizon, action_dim) are validated and
+       sliced column-wise into individual single-tick Action dictionaries.
     """
 
     def __init__(
@@ -76,12 +112,29 @@ class VectorAdapter:
         *,
         observation_schema: Schema,
         action_schema: Schema,
-        cameras: Mapping[str, str],  # Model camera name -> observation field.
-        state: Sequence[StateSlot],
-        commands: Sequence[CommandSlot],
+        cameras: Mapping[
+            str, str
+        ],  # Mapping: model camera identifier -> observation field name.
+        state: Sequence[StateSlot],  # Ordered sequence of StateSlot extractors.
+        commands: Sequence[CommandSlot],  # Ordered sequence of CommandSlot unpackers.
     ) -> None:
+        """Construct and validate a VectorAdapter against robot schemas.
+
+        Args:
+            observation_schema: Schema of the robot's physical observations.
+            action_schema: Schema of the robot's physical commands.
+            cameras: Mapping from model camera names (e.g. 'head_left') to physical
+                observation fields (e.g. 'head_camera').
+            state: Ordered sequence defining how physical fields assemble into the state vector.
+            commands: Ordered sequence defining how action columns map into command fields.
+
+        Raises:
+            ValueError: If cameras, state slots, or command slots fail validation or do not
+                exactly partition the target schemas.
+        """
         validate_schema(observation_schema)
         validate_schema(action_schema)
+
         if not cameras:
             raise ValueError("at least one camera is required")
         for name, field in cameras.items():
@@ -91,6 +144,8 @@ class VectorAdapter:
             if spec.dtype != "uint8" or len(spec.shape) != 3 or spec.shape[2] != 3:
                 raise ValueError(f"camera {name!r}: {field!r} is not RGB uint8 HWC")
         self._cameras = dict(cameras)
+
+        # Validate state slot definitions.
         self._state: list[tuple[str, NDArray[np.intp], tuple[float, float] | None]] = []
         for slot in state:
             spec = observation_schema.get(slot.field)
@@ -105,6 +160,8 @@ class VectorAdapter:
             self._state.append((slot.field, np.asarray(index, np.intp), slot.limits))
         if not self._state:
             raise ValueError("at least one state slot is required")
+
+        # Validate command slot definitions and compute column slice partitions.
         self._commands: list[tuple[str, slice, FeatureSpec, Any]] = []
         start = 0
         for slot in commands:
@@ -117,10 +174,15 @@ class VectorAdapter:
                 (slot.field, slice(start, start + width), spec, slot.clip)
             )
             start += width
+
+        # Ensure command slots exactly cover the declared action schema without omissions or duplicates.
         if sorted(field for field, *_ in self._commands) != sorted(action_schema):
             raise ValueError("command slots must cover every action field once")
+
         self.action_dim = start
         self.state_dim = sum(len(index) for _, index, _ in self._state)
+
+        # Declare the expected model request schema for handshake validation with the server.
         self.request_schema: Schema = MappingProxyType(
             {
                 **{
@@ -132,6 +194,17 @@ class VectorAdapter:
         )
 
     def state_vector(self, observation: Observation) -> NDArray[np.float32]:
+        """Extract and assemble the concatenated 1D float32 state vector from an observation.
+
+        Args:
+            observation: Robot observation snapshot.
+
+        Returns:
+            Concatenated 1D float32 array of shape (state_dim,).
+
+        Raises:
+            ValueError: If extracted state contains non-finite values (NaN / inf).
+        """
         parts = []
         for field, index, limits in self._state:
             values = observation.samples[field].value[index].astype(np.float64)
@@ -147,6 +220,10 @@ class VectorAdapter:
     def to_request(
         self, observation: Observation, context: InferenceContext
     ) -> Mapping[str, NDArray[Any]]:
+        """Construct the model input dictionary containing camera views and state vector.
+
+        Images are referenced directly without copying.
+        """
         return {
             **{
                 IMAGE_PREFIX + name: observation.samples[field].value
@@ -158,6 +235,18 @@ class VectorAdapter:
     def to_actions(
         self, result: Mapping[str, NDArray[Any]], observation: Observation
     ) -> ActionChunk:
+        """Unpack a predicted action trajectory matrix into an ActionChunk.
+
+        Args:
+            result: Model output mapping containing ACTIONS_KEY with shape (horizon, action_dim).
+            observation: The original Observation snapshot associated with this prediction.
+
+        Returns:
+            ActionChunk containing a sequence of complete physical Action mappings.
+
+        Raises:
+            ValueError: If action matrix shape or dimension does not match action_dim.
+        """
         values = np.asarray(result[ACTIONS_KEY])
         if (
             values.ndim != 2
@@ -169,6 +258,7 @@ class VectorAdapter:
                 f"expected finite float actions with shape (H, {self.action_dim}), "
                 f"got {values.dtype} {values.shape}"
             )
+
         actions: list[Action] = []
         for row in values:
             action = {}

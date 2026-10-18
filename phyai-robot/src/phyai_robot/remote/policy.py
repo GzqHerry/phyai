@@ -1,4 +1,22 @@
-"""Synchronous model RPC with a resident predictor and leased run ownership."""
+"""Synchronous model RPC with a resident predictor and leased run ownership.
+
+Architecture:
+    This module implements Protocol v2 of the phyai-robot remote inference protocol:
+    1. Zero Robot Imports: The model server (`PolicyServer`) operates exclusively on named
+       model arrays (such as 'image.<camera>' and 'state' -> 'actions'). It has zero dependencies
+       on robot hardware, ROS 2, or robot-specific layout code.
+    2. Zero Memory Copies: Multipart ZMQ messages carry raw contiguous C-order bytes.
+       Data is packed from and unpacked directly into NumPy array buffers without serialization copies.
+    3. Socket Lifecycle & Thread Handoff: `RemotePolicy` reuses a single ZMQ REQ socket protected
+       by a mutual-exclusion Lock. The lock acquisition provides the memory fence required by ZMQ
+       to safely hand off the underlying socket across thread boundaries (e.g. from the warmup
+       thread to the deployment background inference worker thread).
+    4. Autonomous Lease Expiration: `PolicyServer` enforces an idle timeout (`lease_timeout_s`,
+       default 60s). If an active client process terminates abruptly or loses connectivity without
+       calling "end", the server automatically frees its run reservation, avoiding permanent lockup.
+    5. No Automatic Retries: Hardware safety dictates that failed RPC exchanges are never replayed,
+       preventing duplicated noise draws, trajectory desynchronization, or stale command emission.
+"""
 
 from __future__ import annotations
 
@@ -27,23 +45,29 @@ Arrays = Mapping[str, NDArray[Any]]
 
 
 class RemotePolicyError(RuntimeError):
-    """The server rejected a request or its reply did not match this run."""
+    """Exception raised when the policy server rejects a request or returns mismatched run IDs."""
 
 
 def _positive(name: str, value: float) -> None:
+    """Verify that a timeout parameter is a finite, positive float."""
     if isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be finite and positive")
 
 
 class RemotePolicy:
-    """A Policy whose request and result are named model arrays.
+    """Synchronous ZMQ client exposing a Policy interface over a remote network socket.
 
-    Call info/begin_run before enabling hardware, then warmup exactly once and
-    discard its result. RobotDeployment may call predict on its worker thread.
-    One REQ socket is reused across calls; a lock serializes them, which also
-    provides the memory barrier ZMQ requires to move a socket between threads.
-    Requests are never retried: a failed begin or prediction invalidates this
-    client. The server releases an abandoned run after its lease expires.
+    Lifecycle:
+        1. Query model contract: `spec = client.info()`
+        2. Reserve server run:   `client.begin_run()`
+        3. Execute warmup:       `client.warmup(inputs)` (discard output)
+        4. Cyclic inference:     `outputs = client.predict(inputs)`
+        5. Terminate run:        `client.close()`
+
+    Concurrency & Thread Safety:
+        Calls to info, begin_run, warmup, predict, and close are serialized under `_lock`.
+        If close() is called while a background prediction is in-flight on another thread,
+        the socket is not destroyed underneath it; the owning thread releases the run upon return.
     """
 
     def __init__(
@@ -53,13 +77,22 @@ class RemotePolicy:
         timeout_s: float = 2.0,
         warmup_timeout_s: float = 120.0,
     ) -> None:
+        """Initialize RemotePolicy client.
+
+        Args:
+            endpoint: ZMQ socket endpoint URL (e.g. 'tcp://127.0.0.1:5555').
+            timeout_s: Per-exchange timeout budget in seconds for regular calls (info, begin, predict, end).
+            warmup_timeout_s: Extended timeout budget for warmup (allows lazy JIT & CUDA graph capture).
+        """
         _positive("timeout_s", timeout_s)
         _positive("warmup_timeout_s", warmup_timeout_s)
         self.endpoint = endpoint
         self.timeout_s, self.warmup_timeout_s = timeout_s, warmup_timeout_s
-        # close() never waits for a slow request. The closing event transfers
-        # end-run and socket cleanup to the thread that owns the lock.
-        self._lock, self._closing = Lock(), Event()
+
+        self._lock = (
+            Lock()
+        )  # Serializes RPC calls and provides cross-thread socket handoff fence.
+        self._closing = Event()  # Signals client termination to active in-flight calls.
         self._context: Any = None
         self._socket: Any = None
         self._run_id: str | None = None
@@ -70,10 +103,11 @@ class RemotePolicy:
 
     @property
     def spec(self) -> PolicySpec | None:
-        """The spec returned by begin_run, or None before a run starts."""
+        """Return the PolicySpec returned by begin_run, or None before run reservation."""
         return self._spec
 
     def _connect(self) -> Any:
+        """Lazily initialize ZMQ context and REQ socket with low-latency options."""
         import zmq
 
         if self._context is None:
@@ -81,14 +115,16 @@ class RemotePolicy:
         if self._socket is None:
             socket = self._context.socket(zmq.REQ)
             socket.setsockopt(zmq.LINGER, 0)
-            # Do not queue a request while no server is connected.
-            socket.setsockopt(zmq.IMMEDIATE, 1)
+            socket.setsockopt(
+                zmq.IMMEDIATE, 1
+            )  # Drop message if server endpoint is not connected.
             socket.setsockopt(zmq.MAXMSGSIZE, MAX_BYTES)
             socket.connect(self.endpoint)
             self._socket = socket
         return self._socket
 
     def _disconnect(self) -> None:
+        """Safely close and destroy the active REQ socket."""
         if self._socket is not None:
             self._socket.close(linger=0)
             self._socket = None
@@ -101,11 +137,10 @@ class RemotePolicy:
         *,
         timeout_s: float | None = None,
     ) -> tuple[dict[str, Any], list[NDArray[Any]]]:
-        """Perform one exchange while the caller owns the client lock.
+        """Perform a single synchronous request-reply exchange over ZMQ.
 
-        One deadline covers connection readiness, send and response wait. There
-        is no replay after a timeout: the server may already have advanced its
-        RNG even when the reply never arrives.
+        Must be called while holding self._lock. Monotonic deadline covers socket readiness,
+        message transmission, and server reply reception.
         """
         import zmq
 
@@ -137,10 +172,11 @@ class RemotePolicy:
             wait(zmq.POLLIN)
             response, values = unpack(socket.recv_multipart(flags=zmq.DONTWAIT))
         except BaseException:
-            # A REQ socket cannot send again until it receives a reply. Replace
-            # it so a later end/close cannot consume this request's late reply.
+            # When an exchange times out or fails, REQ socket state becomes invalid.
+            # Destroy the socket so subsequent calls don't consume late response frames.
             self._disconnect()
             raise
+
         if response.get("request_id") != request_id:
             raise RemotePolicyError("policy response request ID mismatch")
         if operation != "begin" and response.get("run_id") != run_id:
@@ -150,22 +186,19 @@ class RemotePolicy:
         return response, values
 
     def _ensure_open(self) -> None:
+        """Verify that the client has not encountered an unrecoverable failure or closed."""
         if self._closing.is_set() or self._failed:
             raise RuntimeError("RemotePolicy is closed or failed; create a new client")
 
     def info(self) -> PolicySpec:
-        """Read the model contract without reserving or resetting a run."""
+        """Query model specifications and input/output schemas without reserving a run."""
         with self._lock:
             self._ensure_open()
             result, _ = self._rpc("info")
             return PolicySpec.from_dict(result["spec"])
 
     def begin_run(self) -> PolicySpec:
-        """Reserve the server and reset its noise stream.
-
-        A busy server is an error; this never takes ownership from another
-        live client. Use a new RemotePolicy for every robot run.
-        """
+        """Reserve server run, reset RNG noise stream, and receive validated PolicySpec."""
         with self._lock:
             self._ensure_open()
             if self._run_id is not None:
@@ -183,11 +216,11 @@ class RemotePolicy:
                 raise
 
     def warmup(self, inputs: Arrays) -> dict[str, NDArray[Any]]:
-        """Consume the run's first prediction; the caller must not execute it."""
+        """Trigger initial model warmup inference; output must be discarded by caller."""
         return self._predict(inputs, warmup=True)
 
     def predict(self, request: Arrays) -> dict[str, NDArray[Any]]:
-        """Return the model outputs after this run completed its warmup."""
+        """Execute one synchronous prediction cycle on model input arrays."""
         return self._predict(request, warmup=False)
 
     def _predict(self, inputs: Arrays, *, warmup: bool) -> dict[str, NDArray[Any]]:
@@ -216,16 +249,12 @@ class RemotePolicy:
                     self._shutdown()
 
     def _shutdown(self) -> None:
-        """Release the run once and free sockets; the caller holds the lock.
-
-        Release is best effort: if the server is unreachable or already dropped
-        the run, its lease frees the server, so close() only logs the failure.
-        """
+        """End the server run and terminate ZMQ sockets; caller must hold self._lock."""
         try:
             if self._run_id is not None:
                 try:
                     self._rpc("end")
-                except Exception as error:  # noqa: BLE001 - the lease covers a failed release
+                except Exception as error:  # noqa: BLE001 - lease will expire if unreachable
                     logger.warning("Could not release run %s: %s", self._run_id, error)
                 finally:
                     self._run_id = None
@@ -236,10 +265,10 @@ class RemotePolicy:
                 self._context = None
 
     def close(self) -> None:
-        """Call after robot stop/close; never destroys an in-flight request.
+        """Initiate client shutdown and release remote run.
 
-        If prediction is still running, its thread releases the run. A failed
-        release leaves the run to the server's lease timeout.
+        Safe to invoke while background predictions are in-flight; ownership cleanup
+        is safely deferred to the executing thread without destroying sockets.
         """
         self._closing.set()
         if self._lock.acquire(blocking=False):
@@ -250,20 +279,21 @@ class RemotePolicy:
 
 
 class ModelPolicy(Protocol):
-    """Server-side predictor from named model inputs to named model outputs."""
+    """Protocol for server-side policy predictors operating on named model arrays."""
 
-    def predict(self, inputs: Arrays) -> Arrays: ...
+    def predict(self, inputs: Arrays) -> Arrays:
+        """Run inference forward pass on preprocessed model input arrays."""
+        ...
 
 
 class PolicyServer:
-    """Serve an existing predictor to one robot run at a time.
+    """ZMQ server hosting a resident ModelPolicy and managing sequential robot runs.
 
-    reset_run resets the predictor's noise stream, not its engine. The
-    application owns the predictor; this server owns only its ZMQ resources.
-    A run that sends no request for lease_timeout_s is released, so a crashed
-    or disconnected client cannot keep the model busy. Keep lease_timeout_s
-    larger than the client's longest gap between requests.
-    Bind loopback unless a trusted remote robot explicitly needs network access.
+    Features:
+    - 1-at-a-time Exclusivity: Only one client run can hold reservation at any time.
+    - Automatic Lease Recovery: Automatically frees reservation if client is silent
+      for `lease_timeout_s` (default 60s).
+    - Unchanged Model State: Serves multiple robot episodes without reloading model weights.
     """
 
     def __init__(
@@ -275,6 +305,15 @@ class PolicyServer:
         endpoint: str = "tcp://127.0.0.1:5555",
         lease_timeout_s: float = 60.0,
     ) -> None:
+        """Initialize PolicyServer.
+
+        Args:
+            policy: Server-side model predictor.
+            spec: Declared PolicySpec defining input/output schemas and metadata.
+            reset_run: Callback to reset the initial diffusion noise generator.
+            endpoint: ZMQ bind URL (e.g. 'tcp://127.0.0.1:5555').
+            lease_timeout_s: Inactive run lease expiration duration in seconds.
+        """
         spec.to_dict()
         _positive("lease_timeout_s", lease_timeout_s)
         self.policy, self.spec = policy, spec
@@ -287,10 +326,11 @@ class PolicyServer:
 
     @property
     def run_id(self) -> str | None:
+        """Return the active run reservation identifier, or None if idle."""
         return self._run_id
 
     def expire_lease(self, now: float | None = None) -> bool:
-        """Release the active run if its lease has expired; return True if so."""
+        """Check lease expiration and automatically free abandoned run reservations."""
         now = time.monotonic() if now is None else now
         if self._run_id is None or now < self._lease_deadline:
             return False
@@ -305,18 +345,16 @@ class PolicyServer:
     def _dispatch(
         self, request: Mapping[str, Any], arrays: list[NDArray[Any]]
     ) -> tuple[dict[str, Any], list[NDArray[Any]], str | None]:
-        """Advance idle -> begun -> warmed -> predictions -> idle, synchronously.
-
-        info never changes ownership. Every operation after begin must carry
-        that run's ID and a newer request ID; replay cannot consume more noise.
-        Failures leave the run owned until end or lease expiry.
-        """
+        """Dispatch a single parsed request and return response tuple (meta, arrays, run_id)."""
         op, request_id = request["operation"], request["request_id"]
         if type(request_id) is not int or request_id < 1:
             raise ValueError("invalid request ID")
+
         if op == "info":
             return dict(spec=self.spec.to_dict()), [], request.get("run_id")
+
         self.expire_lease()
+
         if op == "begin":
             if self._run_id is not None:
                 raise RuntimeError(
@@ -331,18 +369,22 @@ class PolicyServer:
                 [],
                 self._run_id,
             )
+
         if self._run_id is None or request.get("run_id") != self._run_id:
             raise ValueError("stale, expired or unknown run ID")
         if request_id <= self._last_request_id:
             raise ValueError("stale request ID")
         self._last_request_id = request_id
+
         if op == "end":
             run_id, self._run_id = self._run_id, None
             return {}, [], run_id
+
         if op not in ("warmup", "predict"):
             raise ValueError("unknown policy operation")
         if (op == "warmup") == self._warmed:
             raise ValueError("warmup is required exactly once before predict")
+
         inputs = read_values(request, arrays, self.spec.inputs)
         payload, values = values_payload(self.policy.predict(inputs), self.spec.outputs)
         self._warmed = True
@@ -351,14 +393,7 @@ class PolicyServer:
     def serve(
         self, *, stop_event: Event | None = None, ready_event: Event | None = None
     ) -> None:
-        """Own a REP socket on this calling thread until Ctrl-C or stop_event.
-
-        ready_event signals a successful bind, not a model warmup. Every
-        consumed request gets one reply, including validation/model errors, so
-        the REP socket can accept another request without changing ownership.
-        The lease is renewed after each reply, so long inference never counts
-        against it.
-        """
+        """Bind ZMQ REP socket and serve client requests synchronously until stopped."""
         import zmq
 
         stop = Event() if stop_event is None else stop_event
@@ -369,10 +404,12 @@ class PolicyServer:
                 socket.bind(self.endpoint)
                 if ready_event is not None:
                     ready_event.set()
+
                 while not stop.is_set():
                     if not socket.poll(100, zmq.POLLIN):
                         self.expire_lease()
                         continue
+
                     request: dict[str, Any] = {}
                     run_id = None
                     try:
@@ -396,7 +433,8 @@ class PolicyServer:
                                 run_id=request.get("run_id"),
                             )
                         )
+
                     socket.send_multipart(reply, copy=False)
-                    # Only successful requests from the owner renew its lease.
+                    # Extend active lease deadline upon successful response transmission.
                     if run_id is not None and run_id == self._run_id:
                         self._lease_deadline = time.monotonic() + self.lease_timeout_s

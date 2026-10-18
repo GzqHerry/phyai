@@ -1,4 +1,16 @@
-"""Schema checks and detached snapshots, without implicit unit or dtype changes."""
+"""Schema validation, array freezing, and observation freshness checks.
+
+This module enforces contract boundaries between physical hardware, transport
+sessions, policy adapters, and control execution loops:
+- Schema validation: Structural verification of FeatureSpec definitions prior to
+  opening physical connections or allocating device resources.
+- Value validation: Strict runtime verification of array shapes, dtypes, and
+  numerical finiteness (no NaNs or infinities in floating-point commands).
+- Single-copy freezing: Arrays are frozen once (flags.writeable=False) upon receipt
+  or preparation. Already frozen arrays are reused without redundant allocation.
+- Freshness auditing: Verification that local host receive ages do not exceed
+  stipulated latency budgets, preventing control execution on stale sensor data.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +26,20 @@ from .types import Action, Sample, Observation, FeatureSpec, ObservationNotReady
 
 
 def validate_schema(schema: Mapping[str, FeatureSpec]) -> None:
-    """Reject ambiguous field layouts before opening any hardware connection."""
+    """Validate a physical data schema before opening any hardware connection.
+
+    Ensures all keys are non-empty strings, specs are valid FeatureSpec instances,
+    shapes consist of positive integers, dtypes belong to supported real/integer/boolean
+    NumPy categories, and component names (if present) match vector dimensionality.
+
+    Args:
+        schema: Mapping of field names to their FeatureSpec descriptions.
+
+    Raises:
+        ValueError: If a field name is empty, shape contains invalid dimensions,
+            dtype is unsupported, or component names are malformed/duplicated.
+        TypeError: If schema values are not FeatureSpec instances.
+    """
     for key, spec in schema.items():
         if not isinstance(key, str) or not key:
             raise ValueError("schema keys must be nonempty strings")
@@ -42,7 +67,22 @@ def validate_schema(schema: Mapping[str, FeatureSpec]) -> None:
 
 
 def validate_values(values: Action, schema: Mapping[str, FeatureSpec]) -> None:
-    """Validate the entire mapping before any command can reach a device."""
+    """Validate a complete mapping of values against their target schema.
+
+    Enforces that:
+    1. The set of provided keys matches the schema exactly (no missing or extra fields).
+    2. Each value is an instance of numpy.ndarray.
+    3. The array shape and dtype match the schema's FeatureSpec specification.
+    4. Floating-point arrays contain only finite values (rejection of NaN or +/-inf).
+
+    Args:
+        values: Field name to NumPy array mapping (e.g. Action or Observation values).
+        schema: Expected schema against which values are validated.
+
+    Raises:
+        ValueError: If keys do not match schema, shapes mismatch, or values contain NaN/inf.
+        TypeError: If an entry is not an ndarray or dtype mismatches.
+    """
     if set(values) != set(schema):
         raise ValueError(
             f"field mismatch: missing={set(schema) - set(values)}, "
@@ -56,15 +96,23 @@ def validate_values(values: Action, schema: Mapping[str, FeatureSpec]) -> None:
             raise ValueError(f"{key}: expected shape {spec.shape}, got {value.shape}")
         if value.dtype != np.dtype(spec.dtype):
             raise TypeError(f"{key}: expected dtype {spec.dtype}, got {value.dtype}")
+        # Numerical integrity: Reject NaN and infinity for floating-point tensors.
         if value.dtype.kind == "f" and not np.isfinite(value).all():
             raise ValueError(f"{key}: contains NaN or infinity")
 
 
 def _is_frozen(value: NDArray[Any]) -> bool:
-    """Return whether no ordinary write path can reach this array's memory.
+    """Check whether an array buffer is immutable and free from external mutation.
 
-    Arrays produced by freeze() own read-only memory. Views qualify only when
-    every array they view is read-only and the final buffer is immutable bytes.
+    An array is considered frozen if its own writeable flag is False and its base
+    memory buffer cannot be mutated through another writeable view.
+
+    Args:
+        value: Candidate NumPy ndarray to inspect.
+
+    Returns:
+        True if the array owns read-only memory or views an immutable base (e.g. bytes);
+        False if any writeable buffer underlies the array.
     """
     array: Any = value
     while isinstance(array, np.ndarray):
@@ -75,12 +123,18 @@ def _is_frozen(value: NDArray[Any]) -> bool:
 
 
 def freeze(value: NDArray[Any]) -> NDArray[Any]:
-    """Return a read-only array that no other owner can modify.
+    """Ensure an array is read-only, reusing already frozen instances without copying.
 
-    Already-frozen arrays are returned unchanged, so a snapshot that passes
-    through a backend, CompositeRobot and RobotDeployment is copied only once.
-    This is an ownership convention, not a security boundary: callers must not
-    deliberately re-enable writes on arrays they received.
+    If the array is already frozen, it is returned directly. Otherwise, a contiguous
+    copy is allocated, its writeable flag is cleared, and the immutable copy is returned.
+    This guarantees zero redundant memory allocations when snapshots traverse
+    multiple internal layers (e.g. Backend -> CompositeRobot -> Deployment).
+
+    Args:
+        value: NumPy array to freeze.
+
+    Returns:
+        An immutable (read-only) NumPy array sharing or containing the same data.
     """
     if not isinstance(value, np.ndarray):
         raise TypeError("snapshots require numpy.ndarray values")
@@ -92,12 +146,29 @@ def freeze(value: NDArray[Any]) -> NDArray[Any]:
 
 
 def freeze_values(values: Action) -> Action:
-    """Freeze every array in a mapping; see freeze() for the copy rule."""
+    """Freeze all arrays in a mapping and return an immutable MappingProxy.
+
+    Args:
+        values: Mapping of field names to NumPy arrays.
+
+    Returns:
+        MappingProxyType wrapping a dictionary of frozen read-only arrays.
+    """
     return MappingProxyType({key: freeze(value) for key, value in values.items()})
 
 
 def freeze_samples(samples: Mapping[str, Sample]) -> Mapping[str, Sample]:
-    """Detach sensor buffers without refreshing cached receive timestamps."""
+    """Detach sensor buffers and return an immutable mapping of timestamped Samples.
+
+    Reuses already frozen arrays within Samples without allocating new memory,
+    while preserving the original host monotonic receive timestamps.
+
+    Args:
+        samples: Mapping of field names to Sample instances.
+
+    Returns:
+        MappingProxyType containing detached, immutable Samples.
+    """
     return MappingProxyType(
         {
             key: sample
@@ -111,7 +182,18 @@ def freeze_samples(samples: Mapping[str, Sample]) -> Mapping[str, Sample]:
 def validate_observation(
     observation: Observation, schema: Mapping[str, FeatureSpec]
 ) -> None:
-    """Check values and clock domains; freshness is checked by check_freshness."""
+    """Verify structural validity and host clock domain of an Observation.
+
+    Checks that all schema fields are present and valid, and verifies that sample
+    reception timestamps belong to the local monotonic clock domain in the past.
+
+    Args:
+        observation: Observation instance to validate.
+        schema: Expected observation schema.
+
+    Raises:
+        ValueError: If schema values mismatch or receive timestamps are negative/in future.
+    """
     validate_values({k: s.value for k, s in observation.samples.items()}, schema)
     now_ns: int = time.monotonic_ns()
     for key, sample in observation.samples.items():
@@ -125,10 +207,19 @@ def validate_observation(
 def check_freshness(
     observation: Observation, max_age_s: float, now_ns: int | None = None
 ) -> None:
-    """Raise ObservationNotReady when any field is older than max_age_s.
+    """Enforce sample freshness bounds across all fields in an observation snapshot.
 
-    Ages use the local monotonic receive time, never a message header clock.
-    Fresh fields do not imply that all sensors captured the same instant.
+    Compares the host reception time of each field against the current local monotonic
+    clock. If any sensor sample has an age exceeding max_age_s (or arrives with a future
+    timestamp), an ObservationNotReady exception is raised listing all stale fields.
+
+    Args:
+        observation: Complete observation snapshot to check.
+        max_age_s: Maximum permitted sample latency in seconds.
+        now_ns: Optional reference monotonic timestamp in nanoseconds (default: current time).
+
+    Raises:
+        ObservationNotReady: If one or more sensor fields are older than max_age_s or in future.
     """
     now_ns = time.monotonic_ns() if now_ns is None else now_ns
     stale = [

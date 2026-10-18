@@ -1,10 +1,22 @@
-"""AgileX dual-Piper robot client. See AGILEX.md for the full startup procedure.
+"""AgileX dual-Piper robot client entry point.
 
-Start serve_pi05 with configs/pi05_agilex.yaml first. This process needs ROS
-Humble and its camera/Piper drivers, but no model stack. It sends robot
-commands after warmup and a fresh observation; Ctrl-C stops publishing.
+Architecture & Execution Flow:
+    1. Reads AgilexClientConfig from dataclass defaults and bundled YAML (configs/agilex.yaml).
+    2. Constructs `AgilexConfig` (specifying ROS 2 domain 0, Orbbec camera topics, Piper CAN
+       JointState topics, and 14-DoF action schema).
+    3. Runs the standardized `phyai_robot.remote.run_remote` lifecycle:
+       - Queries model spec from serve_pi05.py over ZMQ.
+       - Assembles `CompositeRobot` (3 camera backends + 1 joint backend) and `VectorAdapter`.
+       - Connects ROS 2 subscriptions and publishers.
+       - Executes one warmup forward pass and discards output.
+       - Runs the 200 Hz control loop executing StopAndRefill trajectory chunks.
+       - On termination (Ctrl-C or error), cleanly stops topic publishing without homing.
 
+Usage:
+    # Print merged configuration:
     python -m examples.deployment.agilex --print-config
+
+    # Launch live execution:
     python -m examples.deployment.agilex schedule.execution_horizon=20
 """
 
@@ -26,7 +38,19 @@ DEFAULT_CONFIG = Path(__file__).with_name("configs") / "agilex.yaml"
 
 @dataclass
 class AgilexClientConfig:
-    max_steps: int | None = None  # Actual sends; null runs until Ctrl-C.
+    """Complete client configuration schema for AgileX dual-Piper robot deployments.
+
+    Attributes:
+        max_steps: Maximum number of physical commands to dispatch before stopping (null = run indefinitely).
+        robot: Native ROS 2 topics, Piper arm JointState bindings, and Orbbec camera parameters.
+        remote: ZMQ RPC connection parameters to the policy server.
+        control: 200 Hz actuator send loop timing and sensor freshness age budgets.
+        schedule: StopAndRefill trajectory chunk execution and action consumption pacing.
+    """
+
+    max_steps: int | None = (
+        None  # Actual Robot.send_action calls; null runs until Ctrl-C.
+    )
     robot: AgilexConfig = field(default_factory=AgilexConfig)
     remote: RemoteConfig = field(default_factory=RemoteConfig)
     control: ControlConfig = field(default_factory=ControlConfig)

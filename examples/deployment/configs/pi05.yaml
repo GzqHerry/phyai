@@ -12,6 +12,8 @@ policy:
   num_threads: 16
 
 processor:
+  factory: null  # Built-in Pi05Processing; or module:factory / /path/file.py:factory.
+  options: {}  # Extra keyword arguments passed only to an external factory.
   camera_names: null  # Model camera order; required for lerobot-style exports.
   action_dim: null  # Required for lerobot-style exports.
   metadata_file: null  # Metadata JSON relative to the checkpoint; null discovers it.

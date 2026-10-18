@@ -23,8 +23,9 @@ if __package__ in (None, ""):
 
 from phyai_robot.remote import PolicyServer
 
-from .pi05 import Pi05Policy, Pi05Processing, Pi05PolicyConfig, Pi05ProcessorConfig
+from .pi05 import Pi05Policy, Pi05PolicyConfig, Pi05ProcessorConfig
 from .configuration import parse_config, repository_path
+from .processor_loader import build_processing
 
 DEFAULT_CONFIG = Path(__file__).with_name("configs") / "pi05.yaml"
 
@@ -58,7 +59,7 @@ def main(argv=None) -> None:
         validate=Pi05ServerConfig.validate,
     )
     checkpoint = repository_path(config.policy.checkpoint)
-    processing = Pi05Processing(checkpoint, task=config.task, config=config.processor)
+    processing = build_processing(checkpoint, task=config.task, config=config.processor)
     policy = Pi05Policy(config.policy, processing)
     try:
         spec = policy.spec(

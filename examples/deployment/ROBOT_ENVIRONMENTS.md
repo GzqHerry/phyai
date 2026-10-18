@@ -76,6 +76,129 @@ its content becomes 224x126 with 49 black rows above and below in a 224x224 mode
 input. The default `null` preserves the decoded tile's aspect ratio. Deployment
 does not apply training-time random crops, rotations or color jitter.
 
+## Checkpoint processing and external processors
+
+Use `examples.deployment.serve_pi05` for both built-in and external processing.
+Prefer serialized pipelines for transforms that `phyai-utils-tools` supports:
+`PI05Processor.from_pretrained()` loads `policy_preprocessor.json` and
+`policy_postprocessor.json` directly from the checkpoint. Keep `processor.factory`
+null for these exports. External factories cover processing that cannot yet be
+represented by registered steps.
+`processor.factory: null` selects `Pi05Processing`, the deployment wrapper around
+`phyai_utils_tools.models.pi05.PI05Processor`. The wrapper owns the input schema,
+checkpoint statistics and decoding of action targets. The engine consumes its
+processed tensors and does not infer training conventions from weights.
+
+For an external processor, set the factory in the server YAML:
+
+```yaml
+policy:
+  checkpoint: /path/to/export
+processor:
+  factory: /path/to/processors/dataset_processing.py:DatasetProcessing
+  options: {}
+```
+
+An installed Python module also works: `my_processors.dataset:DatasetProcessing`.
+A processor stored alongside the checkpoint can use
+`${policy.checkpoint}/dataset_processing.py:DatasetProcessing`. Relative file
+paths resolve from the checkout root, just like `policy.checkpoint`; the selected
+YAML's location and the shell's working directory do not change that meaning.
+`--print-config` prints the selection without importing external code or loading
+the model. Normal startup imports only the factory explicitly named by the YAML.
+
+The factory receives `checkpoint`, keyword arguments `task` and `config`, and
+any `processor.options` as extra keyword arguments. It must return a
+`Pi05Processing` instance, usually a subclass. This example adds a constant input
+coordinate before the original normalization:
+
+```python
+import numpy as np
+from examples.deployment.pi05 import Pi05Processing
+
+class DatasetProcessing(Pi05Processing):
+    def preprocess(self, inputs):
+        values = dict(inputs)
+        values["state"] = np.array(inputs["state"], copy=True)
+        for index, value in self.metadata.get("state_constants", {}).items():
+            if self.metadata["delta_mask"][int(index)]:
+                raise ValueError("Do not replace a joint delta anchor")
+            values["state"][int(index)] = value
+        return super().preprocess(values)
+```
+
+A subclass can also override `postprocess(normalized, raw_state)`. It must return
+finite absolute targets with shape `(action_horizon, action_dim)` in the dataset's
+units. The same raw request state anchors every action in a chunk. The factory
+also supplies the schema and metadata through the inherited interface; do not
+pass the lower-level `PI05Processor` directly to `Pi05Policy`.
+
+External source files need not be installed or copied into the checkout or
+virtual environment. They run inside the server process, so dependencies must
+be available to that interpreter. Use relative imports such as `from .helpers
+import transform` for sibling files. The loader gives each source path a private
+package namespace and leaves `sys.path` unchanged. Restart the server after
+editing a loaded processor. Selecting another Python environment is a separate
+process boundary, not a factory setting.
+
+### Where training conventions are stored
+
+The built-in wrapper supports two export layouts:
+
+| Export layout | Configuration | Processing |
+|---|---|---|
+| Metadata export | `deployment_metadata.json` and `norm_stats.json` | Quantile state/action normalization; per-dimension delta mask |
+| LeRobot pipeline export | `policy_preprocessor.json`, `policy_postprocessor.json` and their statistics sidecars | The serialized steps select normalization and action decoding |
+
+For metadata exports, `processor.metadata_file` selects an alternative metadata
+JSON. Otherwise the wrapper prefers `deployment_metadata.json`, then requires
+exactly one `*_metadata.json`. The metadata declares `camera_names`, `action_dim`,
+`delta_mask` and `norm_eps`; optional `action_horizon` must match the model config.
+`norm_stats.json` stores `norm_stats.state` and `norm_stats.actions`. This path
+uses q01/q99 normalization with float64 statistics and the declared epsilon.
+It does not select mean/std normalization from the presence of those numbers.
+
+After inverse normalization, a `true` delta-mask element adds the corresponding
+raw state value; a `false` element is already an absolute target. For a model
+trained entirely on absolute targets, set every element to `false`. For joint
+deltas with absolute grippers, mark only the joint dimensions `true`. This mask
+assumes deltas relative to the observation at the start of the chunk. It cannot
+decode incremental deltas or end-effector rotations by itself.
+
+Pipeline exports load the two serialized pipelines. Their normalizer and
+unnormalizer steps record the normalization mode and epsilon, with statistics
+in the referenced `.safetensors` files. Non-default statistic precision is saved
+as `dtype`, for example `"float64"`; configs that omit it retain float32 behavior.
+A `state_constants_processor` step can replace selected raw state coordinates
+before normalization. Its `values` map contains coordinate indices and constants,
+so this training convention stays in the model's pipeline rather than an external
+server wrapper. These optional extensions require a PhyAI version that supports
+them; the JSON layout alone does not guarantee every upstream LeRobot step is
+available.
+
+A delta model must include
+the matching absolute-action decoding step in its postprocessor; the wrapper
+does not add another delta transform on that path. The wrapper reads camera names and action dimension from deployment metadata
+when present; otherwise set `processor.camera_names` and `processor.action_dim`.
+Metadata may also declare `action_dtype` (`float32` by default, or `float64`) for
+the returned NumPy array and wire schema. It does not override the pipeline's
+normalization or apply a second delta transform. Only steps supported by
+`phyai-utils-tools` can be loaded. A different training transform needs its
+matching exported step or an external processing subclass.
+
+For padded model actions and statistics covering only real action dimensions,
+put `slice_action_step` before `unnormalizer_processor` in the serialized
+postprocessor. Follow it with `delta_action_processor` when the training labels
+are relative; omit the delta step for absolute labels. The same raw state anchors
+every target in the chunk. Keep state normalization out of the postprocessor.
+
+A complete serving bundle therefore contains converted model weights,
+`config.json`, local tokenizer files, matching normalization statistics and
+processing metadata or pipelines. A raw training checkpoint with weights alone
+cannot establish action units, dimension order, camera geometry or normalization.
+The server YAML still selects the task and runtime settings; the robot client
+must map its sensors into the advertised schema using the training conventions.
+
 ## Supported robot profiles
 
 | Profile | Native interpreter | ROS / overlays | Important pins |

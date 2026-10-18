@@ -19,7 +19,7 @@ import json
 from typing import Any
 from pathlib import Path
 from threading import Lock, Event
-from dataclasses import replace, dataclass
+from dataclasses import field, replace, dataclass
 from collections.abc import Mapping
 
 import numpy as np
@@ -67,6 +67,10 @@ class Pi05PolicyConfig:
 class Pi05ProcessorConfig:
     """Model-contract details that an export may not record itself."""
 
+    # Null keeps Pi05Processing. Otherwise use module:factory or file.py:factory.
+    factory: str | None = None
+    # Extra keyword arguments for the external factory.
+    options: dict[str, Any] = field(default_factory=dict)
     # Camera names in model order. Required for lerobot-style exports; must
     # match a metadata-style export when given.
     camera_names: list[str] | None = None
@@ -78,6 +82,18 @@ class Pi05ProcessorConfig:
     image_resize_backend: str = "pil"
 
     def validate(self) -> None:
+        if self.factory is not None and (
+            not self.factory.strip() or ":" not in self.factory
+        ):
+            raise ValueError(
+                "processor.factory must be module:factory or file.py:factory"
+            )
+        if self.factory is None and self.options:
+            raise ValueError("processor.options requires processor.factory")
+        if {"checkpoint", "task", "config"}.intersection(self.options):
+            raise ValueError(
+                "processor.options cannot override checkpoint, task or config"
+            )
         names = self.camera_names
         if names is not None and (
             not names or len(set(names)) != len(names) or not all(names)
@@ -146,13 +162,31 @@ class Pi05Processing:
         self._torch = torch
         self.metadata: dict[str, Any] = {}
         if (checkpoint / "policy_preprocessor.json").is_file():
-            if config.camera_names is None or config.action_dim is None:
+            if (
+                config.metadata_file is not None
+                or (checkpoint / "deployment_metadata.json").is_file()
+            ):
+                self.metadata = _read_metadata(checkpoint, config.metadata_file)
+            names = (
+                config.camera_names
+                if config.camera_names is not None
+                else self.metadata.get("camera_names")
+            )
+            width = (
+                config.action_dim
+                if config.action_dim is not None
+                else self.metadata.get("action_dim")
+            )
+            if names is None or width is None:
                 raise ValueError(
                     "lerobot-style exports need processor.camera_names and "
-                    "processor.action_dim"
+                    "processor.action_dim or deployment metadata declaring them"
                 )
-            self.camera_names = list(config.camera_names)
-            self.action_dim = config.action_dim
+            for name, value in (("camera_names", names), ("action_dim", width)):
+                if name in self.metadata and value != self.metadata[name]:
+                    raise ValueError(f"processor.{name} differs from the checkpoint")
+            self.camera_names = list(names)
+            self.action_dim = width
             self._delta_mask = None  # The exported postprocessor decodes deltas.
             self._processor = PI05Processor.from_pretrained(
                 checkpoint,
@@ -163,7 +197,9 @@ class Pi05Processing:
                 action_dim=self.action_dim,
                 params_dtype=torch.float32,
             )
-            self.action_dtype = "float32"
+            self.action_dtype = self.metadata.get("action_dtype", "float32")
+            if self.action_dtype not in ("float32", "float64"):
+                raise ValueError("checkpoint action_dtype must be float32 or float64")
         else:
             metadata = _read_metadata(checkpoint, config.metadata_file)
             self.metadata = metadata
@@ -205,6 +241,11 @@ class Pi05Processing:
                     for step in pipeline.steps
                 ]
             self.action_dtype = "float64"
+        trained_tasks = self.metadata.get("trained_tasks")
+        if trained_tasks is not None and (
+            not isinstance(trained_tasks, list) or self.task not in trained_tasks
+        ):
+            raise ValueError("task is not one of the checkpoint's trained instructions")
         self.image_size = int(self._processor.image_size)
 
     def input_schema(self) -> dict[str, FeatureSpec]:

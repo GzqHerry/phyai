@@ -34,6 +34,7 @@ from phyai_utils_tools.processing.steps.normalize_steps import (
 )
 from phyai_utils_tools.processing.steps.rename_steps import RenameObservationsStep
 from phyai_utils_tools.processing.steps.text_steps import TokenizerStep
+from phyai_utils_tools.processing.steps.state_steps import StateConstantsStep
 
 __all__ = [
     "AddBatchDimensionStep",
@@ -47,6 +48,7 @@ __all__ = [
     "RenameObservationsStep",
     "ResizeWithPadStep",
     "SliceActionStep",
+    "StateConstantsStep",
     "TokenizerStep",
     "UnnormalizerStep",
 ]

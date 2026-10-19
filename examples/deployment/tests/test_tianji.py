@@ -102,6 +102,10 @@ def test_build_binds_topics_and_decodes_the_mosaic_on_one_worker(ros_messages):
     assert embodiment.robot.observation_schema["head_camera"].shape == (8, 8, 3)
     feedback = command._observations[("joint_position_left", "joint_position_right")]
     assert feedback.topic == "/tj/info/joint_feedback"
+    for side, suffix in (("left", "L"), ("right", "R")):
+        output = command._actions[f"gripper_{side}"]
+        assert output.topic == f"/tj/control/user/gripperValue{suffix}"
+        assert output.message_type is ros_messages["Float32"]
 
 
 def test_mosaic_tiles_are_stretched_like_training_then_letterboxed(ros_messages):

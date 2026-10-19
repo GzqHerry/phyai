@@ -57,6 +57,11 @@ robot:
   # 0.0 corresponds to closed, 1.6 corresponds to fully open travel.
   gripper_limits_rad: [0.0, 1.6]
 
+  # User/VLA inputs of the gripper mux; it owns the final motor-driver topics.
+  gripper_command_topics:
+    left: /tj/control/user/gripperValueL
+    right: /tj/control/user/gripperValueR
+
   # Camera ingestion source:
   #   "mosaic": Subscribes to the unified H.264 compressed mosaic stream (/quad_tile/compressed_undistorted).
   #             Delivers ~30 fps at ~1 MB/s using single-thread zero-latency slice decoding.

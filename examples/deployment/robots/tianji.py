@@ -155,8 +155,9 @@ class TianjiConfig:
     joint_command_topics: dict[str, str] = _sides(
         left="/tj/control/user/joint_cmd_A", right="/tj/control/user/joint_cmd_B"
     )
+    # Send VLA targets through the source mux, which owns the final driver topics.
     gripper_command_topics: dict[str, str] = _sides(
-        left="/control/gripperValueL", right="/control/gripperValueR"
+        left="/tj/control/user/gripperValueL", right="/tj/control/user/gripperValueR"
     )
     service_namespace: str = "/tj/control"
     qos: dict[str, str] = field(

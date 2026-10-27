@@ -135,6 +135,56 @@ postprocessing, but excludes ROS and RPC. It is not a measurement of isolated
 GPU kernels or physical control rate. Match checkpoint, input, task, precision,
 denoising steps and CUDA Graph settings when comparing engines.
 
+## Workbench control service
+
+`examples.deployment.workbench` adds an authenticated HTTP lifecycle around the
+resident model server and ARX robot sessions. It runs in the robot environment;
+the model subprocess uses a separate Python executable. Enactive is not imported
+or called. Starting the service creates no ROS nodes and loads no model weights.
+
+Copy `configs/arx_workbench.json` to a private configuration directory, replace
+the token with a random value of at least 24 characters, and set the installation,
+checkpoint and log paths. Restrict access to the configuration file. Set
+`robot.controller_interface: workbench` in the client YAML when the resident ARX
+controllers expose the workbench services. Configure `remote.endpoint` to use a
+dedicated loopback model port and `processor.camera_names` to match the export.
+Verify the two preparation poses against the site's existing driver settings.
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$ARX_ROS_WORKSPACE/install/setup.bash"
+.venv-robot/bin/python -m examples.deployment.workbench \
+  --config /etc/phyai/arx-workbench.json
+```
+
+Every endpoint requires `Authorization: Bearer <token>`:
+
+| Method and path | Behavior |
+| --- | --- |
+| `GET /state` | Read model and session state; no device operation. |
+| `POST /model/load` | Load `checkpoint_path` from an allowed root, without connecting to ROS. |
+| `POST /model/unload` | Stop the session, wait for cleanup, then unload the owned model process. |
+| `POST /robot/prepare` | Explicitly move to the configured ready pose; no model is required. |
+| `POST /run/start` | Accept `checkpoint_path`, `prompt` and a unique `request_id`; start a robot session after warmup. |
+| `POST /run/stop` | Cancel pending activation and wait for the session worker to exit. |
+
+A start request updates the model's task through the optional `begin_run` options
+before warmup, without reloading weights. Repeating the same `request_id` is
+idempotent, including after a stop. A different task needs a new request ID.
+Stopping during warmup prevents later controller activation. Only an explicit
+prepare or start request constructs robot transports; model-only tests can use
+`RemotePolicy` directly with synthetic images and state arrays.
+
+The sample ranges are static driver bounds for the six arm joints. Raw grippers
+keep their native units. This integration does not add a target-step limit.
+`quiescent` confirms that the session worker has exited; it is not a measured
+physical emergency-stop acknowledgement.
+
+On Blackwell, FlashInfer 0.6.17 requires CUDA 12.9 or newer. A model executable
+wrapper may select a private CUDA toolkit and put the model environment's `bin`
+directory on `PATH` for Ninja. Keep these settings out of the robot environment
+and existing Enactive service.
+
 ## Software checks
 
 ```bash
